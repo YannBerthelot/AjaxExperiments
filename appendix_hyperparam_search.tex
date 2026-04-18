@@ -1,0 +1,365 @@
+\section*{Appendix: Hyperparameter Search Methodology}
+\label{app:hyperparam}
+
+\subsection*{Algorithm and Environment}
+
+We tune vanilla SAC (no expert guidance) on the \texttt{Plane} environment with
+target and initial altitudes drawn uniformly from $[3{,}000, 8{,}000]$\,m and
+episodes capped at $10{,}000$ steps.
+The optimisation objective is the mean episodic reward evaluated over 25 test
+episodes, logged every $10{,}000$ environment steps.
+
+\subsection*{Search Algorithm}
+
+We use \textbf{Optuna's Tree-structured Parzen Estimator (TPE)}~\cite{bergstra2011tpe},
+persisted in a SQLite database (\texttt{hp\_results/optuna.db}) for full
+resume-safety.
+After an initial random phase of roughly 10 trials, TPE fits two kernel density
+estimates $p(\mathbf{x} \mid \text{good})$ and $p(\mathbf{x} \mid \text{bad})$
+from completed trials and proposes the next configuration by maximising the ratio
+$p(\mathbf{x} \mid \text{good}) / p(\mathbf{x} \mid \text{bad})$.
+
+\subsection*{Two-Phase Protocol}
+
+Because the SAC training loop is a monolithic JAX-JIT call without mid-training
+callbacks, standard asynchronous successive halving (ASHA) cannot prune running
+trials.
+We instead adopt a two-phase design that recovers most of ASHA's sample
+efficiency:
+
+\begin{description}
+  \item[Phase~1 — Exploration.]
+    Each of the $N = 40$ TPE trials is trained for
+    $3 \times 10^{5}$ timesteps over \textbf{5 independent seeds}.
+    The trial score is the final (last-logged) value of the mean episodic reward,
+    averaged across seeds.
+
+  \item[Phase~2 — Confirmation.]
+    The top-$K$ configurations from Phase~1 are re-trained for
+    $10^{6}$ timesteps over \textbf{15 independent seeds}.
+    The trial score is the mean episodic reward averaged over all evaluation
+    points in the last $2 \times 10^{5}$ timesteps and across all seeds,
+    matching the evaluation window used in the final experiments.
+\end{description}
+
+\subsection*{Search Space}
+
+Table~\ref{tab:hp_space} lists the full search space.
+Continuous ranges marked \emph{log} are sampled uniformly on a log scale.
+
+\begin{table}[h]
+\centering
+\caption{Hyperparameter search space for SAC on \texttt{Plane}.}
+\label{tab:hp_space}
+\begin{tabular}{llll}
+\toprule
+\textbf{Hyperparameter} & \textbf{Type} & \textbf{Range / Values} & \textbf{Scale} \\
+\midrule
+Actor learning rate       & Continuous & $[10^{-4},\, 10^{-3}]$    & log   \\
+Critic learning rate      & Continuous & $[10^{-4},\, 10^{-3}]$    & log   \\
+Entropy coefficient lr    & Continuous & $[10^{-4},\, 10^{-3}]$    & log   \\
+Discount factor $\gamma$  & Continuous & $[0.97,\, 0.999]$          & linear\\
+Polyak coefficient $\tau$ & Continuous & $[5\times10^{-4},\, 5\times10^{-2}]$ & log \\
+Initial entropy coeff $\alpha_0$ & Continuous & $[0.05,\, 2.0]$      & log   \\
+Target entropy per dim    & Continuous & $[-4.0,\, -0.2]$           & linear\\
+Batch size                & Categorical & $\{256,\, 512\}$          & —     \\
+Network width             & Categorical & $\{256,\, 512\}$          & —     \\
+Gradient clipping         & Categorical & $\{\text{none},\, 0.5,\, 1.0\}$ & — \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All actor and critic networks are two-hidden-layer MLPs with ReLU activations and
+equal width $w \in \{256, 512\}$, i.e.\ architecture $(w, \texttt{relu}, w,
+\texttt{relu})$.
+Gradient clipping, when enabled, clips by global $\ell_2$ norm.
+
+\subsection*{Compute Budget}
+
+Phase~1 consumes at most $40 \times 5 \times 3\times10^{5} = 6\times10^{7}$
+environment steps.
+Phase~2 (top-$K=5$) adds at most $5 \times 15 \times 10^{6} = 7.5\times10^{7}$
+steps.
+Trials are parallelised across available GPUs; each trial subprocess receives a
+dedicated GPU via \texttt{CUDA\_VISIBLE\_DEVICES}.
+
+% ============================================================
+\section*{Appendix: Hyperparameter Tables}
+\label{app:hptables}
+
+All experiments share the same environment: \texttt{Plane} with target and
+initial altitudes in $[3{,}000, 8{,}000]$\,m, episodes of at most $10{,}000$
+steps, and $1 \times 10^{6}$ total training timesteps.
+Reward is evaluated over 25 test episodes after every $10{,}000$ environment
+steps.
+
+% ------------------------------------------------------------
+\subsection*{SAC Hyperparameters}
+
+Table~\ref{tab:sac_tuned} lists the hyperparameters selected by the Bayesian
+search described above; Table~\ref{tab:sac_fixed} lists the remaining
+hyperparameters that were held fixed across all experiments.
+
+\begin{table}[h]
+\centering
+\caption{Tuned SAC hyperparameters (Phase~2 best configuration).}
+\label{tab:sac_tuned}
+\begin{tabular}{lll}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} & \textbf{Notes} \\
+\midrule
+Actor learning rate       & $3.41 \times 10^{-4}$ & log-uniform search \\
+Critic learning rate      & $2.55 \times 10^{-4}$ & log-uniform search \\
+Entropy coeff.\ lr        & $6.13 \times 10^{-4}$ & log-uniform search \\
+Discount $\gamma$         & $0.9805$               & linear search       \\
+Polyak $\tau$             & $8.36 \times 10^{-3}$ & log-uniform search  \\
+Initial ent.\ coeff.\ $\alpha_0$ & $1.207$         & log-uniform search  \\
+Target entropy per dim    & $-0.268$               & linear search       \\
+Batch size                & $256$                  & categorical         \\
+Network width             & $256$                  & categorical         \\
+Gradient clip ($\ell_2$)  & $1.0$                  & categorical         \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Fixed SAC hyperparameters (not tuned, shared by all algorithms).}
+\label{tab:sac_fixed}
+\begin{tabular}{lll}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} & \textbf{Notes} \\
+\midrule
+Replay buffer size        & $1{,}000{,}000$        & transitions \\
+Learning starts           & $10{,}000$             & steps before first update \\
+Number of environments    & $1$                    & \\
+Reward scale              & $1.0$                  & \\
+Number of critics         & $2$                    & double Q-learning \\
+Network architecture      & $(w, \texttt{ReLU}, w, \texttt{ReLU})$ & $w=256$ \\
+Evaluation episodes       & $25$                   & per checkpoint \\
+Log / eval frequency      & $10{,}000$ steps       & \\
+Training timesteps        & $1 \times 10^{6}$      & \\
+Independent seeds         & $100$                  & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ------------------------------------------------------------
+\subsection*{EDGE Hyperparameters}
+
+Table~\ref{tab:ege_hp} reports the hyperparameters for \textbf{EDGE}
+(\texttt{ege\_decay\_050}), the main result.
+EDGE gates between the expert action and the learned policy action using
+$p_{\text{expert}} = \sigma\!\left(\Delta Q / (\tau\,|Q|)\right)$, where
+$\Delta Q = Q(s, \pi^*) - Q(s, \pi_\theta)$ and $|Q|$ is a running scale
+estimate.
+The gating probability decays linearly from $\varepsilon_0$ to $0$ over the
+first $f_{\mathrm{decay}}$ fraction of training.
+
+\begin{table}[h]
+\centering
+\caption{EDGE hyperparameters (main result: \texttt{ege\_decay\_050}).}
+\label{tab:ege_hp}
+\begin{tabular}{lll}
+\toprule
+\textbf{Hyperparameter} & \textbf{Value} & \textbf{Notes} \\
+\midrule
+Gating mode               & Probabilistic (sigmoid) & $p_{\text{expert}} = \sigma(\Delta Q / \tau |Q|)$ \\
+Initial expert probability $\varepsilon_0$ & $0.5$ & \\
+Decay fraction $f_{\mathrm{decay}}$ & $0.50$ & fraction of total training \\
+Gating temperature $\tau$ & $1.0$  & \\
+Expert buffer pre-population & $0$  & buffer fills organically \\
+Expert replay mix fraction & $0.0$ & \\
+Online BC auxiliary loss  & disabled & \\
+Critic updates per step   & $1$    & \\
+Policy update start       & $2{,}000$ steps & \\
+Alpha update start        & $2{,}000$ steps & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ------------------------------------------------------------
+\subsection*{IBRL and Residual Policy Hyperparameters}
+
+Table~\ref{tab:baselines_hp} lists the hyperparameters specific to the two
+additional baselines.
+IBRL~\cite{hu2023ibrl} gates deterministically: the expert action is taken
+whenever $Q(s, \pi^*) > Q(s, \pi_\theta)$ (argmax, no decay).
+Residual RL~\cite{johannink2019residual} outputs a residual $a_\delta$ that is
+added to the (frozen) expert action before environment execution:
+$a = \mathrm{clip}(a_{\pi^*} + a_\delta,\, -1, 1)$.
+
+\begin{table}[h]
+\centering
+\caption{Hyperparameters for IBRL and Residual RL baselines.}
+\label{tab:baselines_hp}
+\begin{tabular}{lll}
+\toprule
+\textbf{Hyperparameter} & \textbf{IBRL} & \textbf{Residual RL} \\
+\midrule
+Gating / action mode         & Argmax (deterministic) & $\mathrm{clip}(a_{\pi^*} + a_\delta,\,-1,1)$ \\
+Expert gating decay          & none ($f_{\mathrm{decay}}=0$) & — \\
+Expert buffer pre-population & $0$            & $0$ \\
+Expert replay mix fraction   & $0.0$          & $0.0$ \\
+Online BC auxiliary loss     & disabled       & disabled \\
+Critic updates per step      & $1$            & $1$ \\
+Policy update start          & $2{,}000$ steps & $10{,}000$ steps \\
+Alpha update start           & $2{,}000$ steps & $10{,}000$ steps \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% ============================================================
+\section*{Appendix: Statistical Tests}
+\label{app:stats}
+
+\subsection*{Overview}
+
+All pairwise comparisons are made between EDGE (\texttt{ege\_decay\_050}, the
+main result) and each of the three baselines: vanilla SAC, Residual RL, and
+IBRL.
+Using a single reference method eliminates logical constraints between the
+tested hypotheses, so we apply the Holm–Bonferroni step-down procedure for
+multiplicity control.
+Each family therefore contains $K = 3$ comparisons and controls the
+family-wise error rate at $\alpha = 0.05$.
+
+\subsection*{Test Statistic: Inter-Quartile Mean (IQM)}
+
+The Inter-Quartile Mean (IQM) trims the bottom and top $25\%$ of the seed
+distribution and averages the remainder.
+For a sorted sample $x_{(1)} \le \cdots \le x_{(n)}$:
+\begin{equation}
+  \mathrm{IQM}(x) =
+    \frac{1}{h - l}
+    \sum_{i=l}^{h-1} x_{(i)},
+  \quad
+  l = \lfloor 0.25\,n \rfloor,\;
+  h = \lceil  0.75\,n \rceil.
+  \label{eq:iqm}
+\end{equation}
+We operate on per-seed scalar summaries (described below) so that each seed
+contributes exactly one observation to the IQM.
+With $100$ seeds the IQM discards the $25$ lowest- and $25$ highest-performing
+seeds, averaging the central $50$.
+
+\subsection*{Test Families}
+
+Two separate families of tests are conducted on the
+\textbf{Normalised Expert Advantage} metric, defined as
+\begin{equation}
+  \mathrm{NEA}_t =
+    \frac{\bar{r}_t^{\pi} - \bar{r}_t^{*}}{\mathrm{MAX\_SCORE} - \bar{r}_t^{*}},
+\end{equation}
+where $\bar{r}_t^{\pi}$ is the policy's mean episodic reward at step $t$,
+$\bar{r}_t^{*}$ is the expert's mean episodic reward, and
+$\mathrm{MAX\_SCORE}$ is the theoretical maximum.
+Higher values indicate a policy closer to expert-level performance; $\mathrm{NEA}=0$
+means the policy matches the expert.
+
+\paragraph{Asymptote.}
+For each seed, the IQM of all evaluation checkpoints in the \emph{last}
+$200{,}000$ environment steps is computed, yielding one scalar per seed.
+This measures long-run performance.
+
+\paragraph{Steps to threshold.}
+For each seed, the first step at which NEA permanently crosses a
+threshold $y^*$ is recorded.
+Seeds that never cross $y^*$ within the $10^6$-step budget are
+\emph{budget-censored}: they receive the value $10^6$ (RMST-style imputation).
+Thresholds $y^* \in \{0.0,\, 0.2,\, 0.4\}$ measure how quickly each method
+closes $0\%$, $20\%$, and $40\%$ of the gap to the expert.
+
+\subsection*{Permutation Test}
+
+For a comparison between groups $A$ (EDGE) and $B$ (baseline) with per-seed
+observations $\mathbf{x}_A$ and $\mathbf{x}_B$, the observed test statistic is
+\begin{equation}
+  T_{\mathrm{obs}} = \mathrm{IQM}(\mathbf{x}_A) - \mathrm{IQM}(\mathbf{x}_B).
+\end{equation}
+Under the null hypothesis $H_0$: the two groups are exchangeable, we pool
+$\mathbf{x} = [\mathbf{x}_A; \mathbf{x}_B]$ and draw $B = 10{,}000$
+permutations.
+For each permutation $\pi^{(b)}$ the statistic
+$T^{(b)} = \mathrm{IQM}(\pi^{(b)}_{1:|A|}) - \mathrm{IQM}(\pi^{(b)}_{|A|+1:})$
+is computed.
+The two-sided Monte Carlo p-value is
+\begin{equation}
+  p_{\mathrm{raw}} =
+    \frac{1}{B}\sum_{b=1}^{B}
+    \mathbf{1}\!\left[|T^{(b)}| \ge |T_{\mathrm{obs}}|\right].
+\end{equation}
+The random number generator is seeded at $42$ for reproducibility.
+
+\subsection*{Holm–Bonferroni Correction}
+
+Let $p_{(1)} \le p_{(2)} \le p_{(3)}$ be the sorted raw p-values for the three
+comparisons and let $H_{(k)}$ denote the corresponding hypothesis.
+The Holm–Bonferroni adjusted p-values are
+\begin{equation}
+  \tilde{p}_{(k)} = \max_{j \le k}\,\min\!\left(1,\; p_{(j)} \cdot (K - j + 1)\right),
+  \quad k = 1, 2, 3.
+\end{equation}
+$H_{(k)}$ is rejected if $\tilde{p}_{(k)} < 0.05$.
+This step-down procedure controls the FWER at $\alpha = 0.05$ under arbitrary
+dependence between tests.
+
+\subsection*{Results}
+
+Tables~\ref{tab:stats_asymptote} and \ref{tab:stats_thresholds} report the
+outcomes.
+$\Delta\,\mathrm{IQM} = \mathrm{IQM}_{\mathrm{EDGE}} - \mathrm{IQM}_{\mathrm{baseline}}$;
+for the asymptote a positive value means EDGE achieves higher normalized expert
+alignment; for steps-to-threshold a negative value means EDGE reaches the target
+level faster.
+Only Holm–Bonferroni adjusted p-values are reported.
+
+\begin{table}[h]
+\centering
+\caption{IQM permutation test + Holm–Bonferroni: asymptote
+         (IQM of Normalised Expert Advantage over last $200{,}000$ steps,
+         $100$ seeds, $10{,}000$ permutations, $\alpha=0.05$).
+         Higher NEA is better; $\Delta\,\mathrm{IQM} > 0$ means EDGE achieves
+         greater expert alignment at convergence.}
+\label{tab:stats_asymptote}
+\begin{tabular}{lrrr}
+\toprule
+\textbf{EDGE vs} & \textbf{$\Delta\,\mathrm{IQM}$} & \textbf{Adj.\ $p$} & \textbf{Reject?} \\
+\midrule
+SAC baseline  & $+0.12$ & $<0.0001$ & Yes \\
+Residual RL   & $+0.04$ & $0.0002$  & Yes \\
+IBRL          & $+0.03$ & $0.0091$  & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{IQM permutation test + Holm–Bonferroni: steps to threshold
+         (Normalised Expert Advantage, budget-censored at $10^6$ steps,
+         $100$ seeds, $10{,}000$ permutations, $\alpha=0.05$).
+         Negative $\Delta\,\mathrm{IQM}$ means EDGE reaches the NEA threshold
+         earlier (fewer steps).
+         ``Censored'' shows budget-censored seeds as EDGE\,/\,baseline out of $100$.}
+\label{tab:stats_thresholds}
+\begin{tabular}{llrrll}
+\toprule
+\textbf{Threshold $y^*$} & \textbf{EDGE vs} & \textbf{$\Delta\,\mathrm{IQM}$ (steps)} & \textbf{Adj.\ $p$} & \textbf{Reject?} & \textbf{Censored} \\
+\midrule
+\multirow{3}{*}{$0.0$}
+  & SAC baseline & $-161{,}300$ & $0.1068$  & No  & $6\,/\,3$  \\
+  & Residual RL  & $+27{,}000$  & $0.7508$  & No  & $6\,/\,1$  \\
+  & IBRL         & $-148{,}400$ & $0.2018$  & No  & $6\,/\,8$  \\
+\midrule
+\multirow{3}{*}{$0.2$}
+  & SAC baseline & $-211{,}300$ & $0.0039$  & Yes & $9\,/\,6$  \\
+  & Residual RL  & $-94{,}300$  & $0.2313$  & No  & $9\,/\,2$  \\
+  & IBRL         & $-139{,}600$ & $0.1878$  & No  & $9\,/\,10$ \\
+\midrule
+\multirow{3}{*}{$0.4$}
+  & SAC baseline & $-177{,}600$ & $<0.0001$ & Yes & $10\,/\,6$  \\
+  & Residual RL  & $-107{,}600$ & $0.0498$  & Yes & $10\,/\,3$  \\
+  & IBRL         & $-69{,}000$  & $0.2823$  & No  & $10\,/\,10$ \\
+\bottomrule
+\end{tabular}
+\end{table}

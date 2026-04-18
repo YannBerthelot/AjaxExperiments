@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+
+# venv
+.venv/
+
+# Experiment outputs / data
+*.csv
+*.pkl
+*_registry.json
+*_registry.json.lock
+*_baseline_cache.json
+*_seeded_projects.json
+speed_test_results.json
+results_exp.txt
+diff.txt
+expert_policy.pkl
+partial_expert_checkpoints/
+plots/
+plots_*/
+.plot_cache/
+hp_results/
+hyperparams/
+logs/
+sweep/
+tensorboard/
+wandb/
+mc_pretrain_data.csv
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
