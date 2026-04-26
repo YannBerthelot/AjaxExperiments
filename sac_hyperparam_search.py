@@ -44,14 +44,20 @@ Multi-GPU architecture
 
 Usage
 ─────────────────────────────────────────────────────────────────────────────
-  python hyperparam_search.py                     # all GPUs, 40 trials
+  python hyperparam_search.py                     # all GPUs, 40 trials, env=Plane
+  python hyperparam_search.py --env Plane         # pick a TargetGym env
   python hyperparam_search.py --gpus 0 1          # restrict to GPUs 0-1
   python hyperparam_search.py --trials 60         # more trials
   python hyperparam_search.py --results           # ranked table
   python hyperparam_search.py --dry-run           # show search space only
   python hyperparam_search.py --phase2 --top-k 5  # confirm top-5 configs
 
-Do NOT run via gpu_launcher — this script manages GPUs internally.
+Per-env artefacts land under hp_results/<env>/ so you can run multiple envs
+in parallel without collisions.  The winning config is saved back into
+hyperparams/ajax_sac.yml under the env name.
+
+This script manages GPUs internally (one launcher process spawns workers
+per GPU); use it directly rather than wrapping it in another launcher.
 """
 
 from __future__ import annotations
@@ -63,32 +69,86 @@ import subprocess
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+from envs import make_env_by_name, registered_envs
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants (per-env paths/names are derived from the --env flag)
 # ---------------------------------------------------------------------------
 
-RESULTS_DIR = Path("hp_results")
-DB_PATH = RESULTS_DIR / "optuna.db"
-STUDY_NAME = "sac_hp_search_plane"
+RESULTS_ROOT = Path("hp_results")
+# Single-phase search: maximize raw eval reward (absolute units).
+# Ranking by eval reward is equivalent to ranking by expert advantage since the
+# expert score is constant for a given env.
 EVAL_TAG = "Eval/episodic_mean_reward"
 
-# Phase 1: short budget for fast exploration
-PHASE1_TIMESTEPS = int(3e5)
-PHASE1_SEEDS = 5
+SUPPORTED_METHODS = (
+    # Paper methods (the ones we'll keep for the final HPO + comparison):
+    "sac",                    # vanilla SAC baseline (no expert)
+    "edge",                   # edge-eps: SAC + ε-greedy expert gating (gating-ablation baseline)
+    "sac_quality_aware",      # SAC + LCB expert gating + obs+state aug (proposed)
+    # Other agents kept for legacy compatibility — not part of the paper.
+    "residual", "ibrl", "pid_policy", "jsrl",
+)
 
-# Phase 2: full budget for statistical confirmation
+
+def _is_td3(method: str) -> bool:
+    return False
+
+
+def _env_slug(env_name: str) -> str:
+    return env_name.lower()
+
+
+def _results_dir(env_name: str, method: str = "sac") -> Path:
+    slug = _env_slug(env_name)
+    # Backwards-compat: legacy SAC results live under hp_results/<env>/ with no
+    # method suffix. New methods get their own namespace.
+    if method == "sac":
+        return RESULTS_ROOT / slug
+    return RESULTS_ROOT / slug / method
+
+
+def _db_path(env_name: str, method: str = "sac") -> Path:
+    return _results_dir(env_name, method) / "optuna.db"
+
+
+def _study_name(env_name: str, method: str = "sac") -> str:
+    return f"{method}_hp_search_{_env_slug(env_name)}"
+
+
+def _project_name(env_name: str, method: str = "sac") -> str:
+    return f"{method}_hyperparam_search_{_env_slug(env_name)}"
+
+# Legacy Phase 1 / Phase 2 constants — retained for backwards-compat with the
+# existing SAC results cached under hp_results/<env>/.  New runs use the
+# single-phase CLI flags (--search-timesteps, --search-seeds, --trials).
+PHASE1_TIMESTEPS = int(3e5)
+PHASE1_SEEDS = 50
 PHASE2_TIMESTEPS = int(1e6)
-PHASE2_SEEDS = 15
-# Average eval metric over the last N steps for Phase 2 (mirrors final experiment eval)
+PHASE2_SEEDS = 50
 PHASE2_EVAL_WINDOW = 200_000
+
+# Default single-phase search budget (symmetric across methods).
+SEARCH_TIMESTEPS = int(1e6)
+SEARCH_SEEDS = 20
+SEARCH_TRIALS = 30
+# Average eval metric over the last N timesteps — mirrors the ablation's
+# trailing-window evaluation so the search target matches the paper's metric.
+SEARCH_EVAL_WINDOW = 200_000
+
+# Asynchronous median pruning on running trials.
+# Survivors run the full budget; pruned trials are SIGTERM'd mid-flight.
+PRUNE_ENABLED_DEFAULT = True
+PRUNE_WARMUP_STEPS = 300_000      # no pruning before this step
+PRUNE_INTERVAL_STEPS = 100_000    # report cadence
+PRUNE_N_STARTUP_TRIALS = 5        # first N trials never pruned (median seed)
 
 LOG_FREQUENCY = 10_000
 NUM_EPISODE_TEST = 25
-PROJECT_NAME = "sac_hyperparam_search_plane"
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +158,13 @@ PROJECT_NAME = "sac_hyperparam_search_plane"
 
 @dataclass
 class HPParams:
-    """One set of SAC hyperparameters — JSON serialisable."""
+    """One set of SAC hyperparameters — JSON serialisable.
+
+    Shared base dims are searched for every method.  EDGE-specific dims
+    (exploration_decay_frac, exploration_tau, fixed_exploration_prob,
+    policy_update_start) are populated only when method == "edge"; for other
+    methods they stay None and fall back to ajax's defaults.
+    """
 
     trial_number: int
     actor_lr: float
@@ -111,6 +177,32 @@ class HPParams:
     batch_size: int
     arch_width: int  # 256 or 512; expands to full arch tuple
     max_grad_norm: Optional[float]  # None = no clipping
+    method: str = "sac"
+    # EDGE-only (None for other methods)
+    exploration_decay_frac: Optional[float] = None
+    exploration_tau: Optional[float] = None
+    fixed_exploration_prob: Optional[float] = None
+    policy_update_start: Optional[int] = None
+    # TD3-only (None for other methods)
+    exploration_noise: Optional[float] = None
+    target_policy_noise: Optional[float] = None
+    target_noise_clip: Optional[float] = None
+    policy_delay: Optional[int] = None
+    # quality-aware-only (None for other methods)
+    pre_train_n_steps: Optional[int] = None
+    num_critics: Optional[int] = None
+    qa_temperature: Optional[float] = None
+    # Expert-buffer prefill (gentler than actor BC — populates replay
+    # buffer with expert transitions, leaves actor weights at random init)
+    expert_buffer_n_steps: Optional[int] = None
+    # target_entropy ramp axes (sac_qa)
+    target_entropy_initial_per_dim: Optional[float] = None
+    target_entropy_ramp_frac: Optional[float] = None
+    # Thompson ε-floor: min P(policy) per step
+    epsilon_floor: Optional[float] = None
+    # LCB gating axes (sac_qa with exploration_lcb=True)
+    lcb_beta_init: Optional[float] = None
+    lcb_temperature: Optional[float] = None
 
     @property
     def actor_architecture(self) -> tuple:
@@ -130,7 +222,12 @@ class HPParams:
     @classmethod
     def from_json(cls, path: Path) -> HPParams:
         with open(path) as f:
-            return cls(**json.load(f))
+            data = json.load(f)
+        # Tolerate legacy keys written by an older orchestrator after the
+        # HPParams surface was pruned (e.g. qa_beta_init, expert_mix_fraction,
+        # imitation_coef). Unknown keys are silently dropped.
+        valid = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in valid})
 
 
 # ---------------------------------------------------------------------------
@@ -138,23 +235,23 @@ class HPParams:
 # ---------------------------------------------------------------------------
 
 
-def _params_path(n: int) -> Path:
-    return RESULTS_DIR / f"trial_{n:03d}_params.json"
+def _params_path(n: int, env_name: str, method: str = "sac") -> Path:
+    return _results_dir(env_name, method) / f"trial_{n:03d}_params.json"
 
 
-def _result_path(n: int, phase2: bool = False) -> Path:
+def _result_path(n: int, env_name: str, phase2: bool = False, method: str = "sac") -> Path:
     suffix = "_phase2" if phase2 else ""
-    return RESULTS_DIR / f"trial_{n:03d}{suffix}_result.json"
+    return _results_dir(env_name, method) / f"trial_{n:03d}{suffix}_result.json"
 
 
-def _log_path(n: int, phase2: bool = False) -> Path:
+def _log_path(n: int, env_name: str, phase2: bool = False, method: str = "sac") -> Path:
     suffix = "_phase2" if phase2 else ""
-    return RESULTS_DIR / f"trial_{n:03d}{suffix}.log"
+    return _results_dir(env_name, method) / f"trial_{n:03d}{suffix}.log"
 
 
-def _tb_folder(n: int, phase2: bool = False) -> str:
+def _tb_folder(n: int, env_name: str, phase2: bool = False, method: str = "sac") -> str:
     suffix = "_phase2" if phase2 else ""
-    return str(RESULTS_DIR / f"trial_{n:03d}{suffix}_tb")
+    return str(_results_dir(env_name, method) / f"trial_{n:03d}{suffix}_tb")
 
 
 # ---------------------------------------------------------------------------
@@ -162,20 +259,103 @@ def _tb_folder(n: int, phase2: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 
-def suggest_params(trial) -> HPParams:
-    """Sample one configuration from the search space."""
+def suggest_params(trial, method: str = "sac") -> HPParams:
+    """Sample one configuration from the search space.
+
+    All methods share the base 10 dims.  EDGE adds 4 method-specific dims on
+    top (decay fraction, softmax temperature, exploration floor, and the
+    warmup length before policy updates start).  Other methods inherit ajax's
+    defaults for those knobs.
+    """
     actor_lr = trial.suggest_float("actor_lr", 1e-4, 1e-3, log=True)
     critic_lr = trial.suggest_float("critic_lr", 1e-4, 1e-3, log=True)
-    alpha_lr = trial.suggest_float("alpha_lr", 1e-4, 1e-3, log=True)
     gamma = trial.suggest_float("gamma", 0.97, 0.999)
     tau = trial.suggest_float("tau", 5e-4, 5e-2, log=True)
-    alpha_init = trial.suggest_float("alpha_init", 0.05, 2.0, log=True)
-    target_entropy_per_dim = trial.suggest_float("target_entropy_per_dim", -4.0, -0.2)
     batch_size = trial.suggest_categorical("batch_size", [256, 512])
     arch_width = trial.suggest_categorical("arch_width", [256, 512])
-    # None is not hashable in Optuna categoricals; use 0 to represent "no clip"
     grad_clip = trial.suggest_categorical("grad_clip", [0, 0.5, 1.0])
     max_grad_norm = None if grad_clip == 0 else float(grad_clip)
+
+    # SAC-only knobs (entropy-related); skipped for TD3 trials so the search
+    # space stays comparably sized rather than exploring dead dimensions.
+    if _is_td3(method):
+        alpha_lr = 1e-4  # placeholder, unused
+        alpha_init = 1.0  # placeholder, unused
+        target_entropy_per_dim = -1.0  # placeholder, unused
+    else:
+        alpha_lr = trial.suggest_float("alpha_lr", 1e-4, 1e-3, log=True)
+        alpha_init = trial.suggest_float("alpha_init", 0.05, 2.0, log=True)
+        # All methods share the same target_entropy_per_dim range. The
+        # earlier sac_qa-specific tightening to [-1.5, -0.2] was put in
+        # place when BC + critic MC pretrain were causing α to collapse
+        # toward 0; both are now removed. edge-eps's best Plane3DCircle
+        # config uses -2.79, which sat outside the tightened range —
+        # that was a structural unfairness against sac_qa.
+        target_entropy_per_dim = trial.suggest_float(
+            "target_entropy_per_dim", -4.0, -0.2
+        )
+
+    # TD3-specific exploration / target-smoothing knobs
+    exploration_noise = None
+    target_policy_noise = None
+    target_noise_clip = None
+    policy_delay = None
+    if _is_td3(method):
+        exploration_noise = trial.suggest_float("exploration_noise", 0.05, 0.4)
+        target_policy_noise = trial.suggest_float("target_policy_noise", 0.1, 0.4)
+        target_noise_clip = trial.suggest_float("target_noise_clip", 0.2, 0.6)
+        policy_delay = trial.suggest_categorical("policy_delay", [1, 2, 4])
+
+    exploration_decay_frac = None
+    exploration_tau = None
+    fixed_exploration_prob = None
+    policy_update_start = None
+    if method in ("edge", "td3_edge"):
+        exploration_decay_frac = trial.suggest_float("exploration_decay_frac", 0.1, 0.8)
+        exploration_tau = trial.suggest_float("exploration_tau", 0.3, 3.0, log=True)
+        fixed_exploration_prob = trial.suggest_float(
+            "fixed_exploration_prob", 0.1, 0.9
+        )
+        if method == "edge":
+            policy_update_start = trial.suggest_int(
+                "policy_update_start", 1_000, 50_000, log=True
+            )
+    pre_train_n_steps = None
+    num_critics = None
+    qa_temperature = None
+    expert_buffer_n_steps_value = None
+    target_entropy_initial_per_dim = None
+    target_entropy_ramp_frac = None
+    epsilon_floor = None
+    lcb_beta_init = None
+    lcb_temperature = None
+    if method == "sac_quality_aware":
+        # Proposed method: SAC + critic ensemble + LCB gating between
+        # policy and (stateful) expert + obs+expert_state augmentation
+        # + agent-side obs normalisation. Method-specific HPO axes:
+        #   num_critics  — ensemble size (drives LCB σ signal)
+        #   lcb_beta_init — disagreement penalty weight
+        #   lcb_temperature — sigmoid sharpness on advantage
+        pre_train_n_steps = 0
+        target_entropy_initial_per_dim = None
+        target_entropy_ramp_frac = None
+        qa_temperature = 1.0  # not used under LCB
+        num_critics = trial.suggest_categorical("num_critics", [2, 4])
+        expert_buffer_n_steps_value = 0
+        epsilon_floor = 0.0
+        lcb_beta_init = trial.suggest_float("lcb_beta_init", 0.1, 5.0, log=True)
+        lcb_temperature = trial.suggest_float("lcb_temperature", 0.1, 10.0, log=True)
+    if method == "jsrl":
+        # JSRL hard handoff: expert acts deterministically during the initial
+        # fraction of training, then the learner takes over. fixed_exploration_prob
+        # stays at 1.0 inside the handoff window; exploration_decay_frac
+        # is the handoff point in training-step fraction.
+        exploration_decay_frac = trial.suggest_float("exploration_decay_frac", 0.05, 0.5)
+        exploration_tau = 1.0
+        fixed_exploration_prob = 1.0
+        policy_update_start = trial.suggest_int(
+            "policy_update_start", 1_000, 50_000, log=True
+        )
 
     return HPParams(
         trial_number=trial.number,
@@ -189,6 +369,24 @@ def suggest_params(trial) -> HPParams:
         batch_size=batch_size,
         arch_width=arch_width,
         max_grad_norm=max_grad_norm,
+        method=method,
+        exploration_decay_frac=exploration_decay_frac,
+        exploration_tau=exploration_tau,
+        fixed_exploration_prob=fixed_exploration_prob,
+        policy_update_start=policy_update_start,
+        exploration_noise=exploration_noise,
+        target_policy_noise=target_policy_noise,
+        target_noise_clip=target_noise_clip,
+        policy_delay=policy_delay,
+        pre_train_n_steps=pre_train_n_steps,
+        num_critics=num_critics,
+        qa_temperature=qa_temperature,
+        expert_buffer_n_steps=expert_buffer_n_steps_value,
+        target_entropy_initial_per_dim=target_entropy_initial_per_dim,
+        target_entropy_ramp_frac=target_entropy_ramp_frac,
+        epsilon_floor=epsilon_floor,
+        lcb_beta_init=lcb_beta_init,
+        lcb_temperature=lcb_temperature,
     )
 
 
@@ -240,79 +438,345 @@ def read_final_metric(
 # ---------------------------------------------------------------------------
 
 
-def run_worker(
-    params: HPParams,
-    n_timesteps: int,
-    n_seeds: int,
-    use_wandb: bool,
-    phase2: bool = False,
-) -> None:
+def _build_method_kwargs(method: str, expert_policy, params: HPParams) -> dict:
+    """Return the method-specific SAC(**kwargs) for a given trial.
+
+    Base HPs from `params` are applied by the caller; this fn only returns the
+    method-specific structural flags + any EDGE-tuned knobs that need to flow
+    in as SAC kwargs.
     """
-    Runs inside a subprocess.  JAX (and GPU allocation) is initialised here,
-    not in the master, so each worker gets a clean CUDA context.
+    if method == "sac":
+        # Vanilla SAC baseline. Agent-side obs normalisation is on
+        # everywhere as a fixed preprocessing detail (not an HPO axis).
+        return dict(
+            expert_policy=None,
+            residual=False,
+            use_pid_policy=False,
+            use_expert_guidance=False,
+            use_expert_guided_exploration=False,
+            expert_buffer_n_steps=0,
+            expert_mix_fraction=0.0,
+            use_mc_critic_pretrain=False,
+            use_online_bc=False,
+            use_online_critic_light_pretrain=False,
+            normalize_obs_running=True,
+        )
+    if method == "edge":
+        # edge-eps: SAC + ε-greedy expert gating, no obs+state augmentation.
+        # Kept as the gating-mechanism ablation against sac_quality_aware (LCB).
+        # Normalisation is on as fixed preprocessing.
+        return dict(
+            expert_policy=expert_policy,
+            residual=False,
+            use_pid_policy=False,
+            use_expert_guidance=False,
+            use_expert_guided_exploration=True,
+            exploration_boltzmann=False,
+            exploration_argmax=False,
+            augment_obs_with_expert_state=False,
+            normalize_obs_running=True,
+            expert_buffer_n_steps=0,
+            expert_mix_fraction=0.0,
+            use_mc_critic_pretrain=False,
+            use_online_bc=False,
+            use_online_critic_light_pretrain=False,
+            use_critic_blend=False,
+            num_critic_updates=1,
+            # EDGE-tuned knobs
+            exploration_decay_frac=params.exploration_decay_frac,
+            exploration_tau=params.exploration_tau,
+            fixed_exploration_prob=params.fixed_exploration_prob,
+            policy_update_start=params.policy_update_start,
+            alpha_update_start=params.policy_update_start,
+        )
+    if method == "residual":
+        return dict(
+            expert_policy=expert_policy,
+            residual=True,
+            use_pid_policy=False,
+            use_expert_guidance=False,
+            use_expert_guided_exploration=False,
+            expert_buffer_n_steps=0,
+            expert_mix_fraction=0.0,
+            use_mc_critic_pretrain=False,
+            use_online_bc=False,
+            use_online_critic_light_pretrain=False,
+        )
+    if method == "ibrl":
+        # Full IBRL: argmax action selection + IBRL bootstrap (max(Q_policy, Q_expert)
+        # TD target, consistent with the argmax policy).
+        return dict(
+            expert_policy=expert_policy,
+            residual=False,
+            use_pid_policy=False,
+            use_expert_guidance=False,
+            use_expert_guided_exploration=True,
+            exploration_argmax=True,
+            exploration_decay_frac=0.0,
+            exploration_boltzmann=False,
+            ibrl_bootstrap=True,
+            expert_buffer_n_steps=0,
+            expert_mix_fraction=0.0,
+            use_mc_critic_pretrain=False,
+            use_online_bc=False,
+            use_online_critic_light_pretrain=False,
+        )
+    if method == "jsrl":
+        # Jump-Start RL with a closed-form expert: deterministic expert
+        # actions during an initial training-step window of length
+        # ``exploration_decay_frac * total_timesteps``, then pure learner.
+        # Because the handoff is applied at training-step granularity rather
+        # than in-episode-step granularity (as in the original JSRL paper),
+        # the implementation is a simplification: expert is "online" during
+        # the early window and "offline" after. Matches JSRL's high-level
+        # behavior for long-horizon tasks where training-step fraction
+        # approximates episodic-horizon fraction.
+        return dict(
+            expert_policy=expert_policy,
+            residual=False,
+            use_pid_policy=False,
+            use_expert_guidance=False,
+            use_expert_guided_exploration=True,
+            exploration_argmax=False,
+            exploration_boltzmann=False,
+            fixed_exploration_prob=params.fixed_exploration_prob,
+            exploration_decay_frac=params.exploration_decay_frac,
+            exploration_tau=params.exploration_tau,
+            ibrl_bootstrap=False,
+            expert_buffer_n_steps=0,
+            expert_mix_fraction=0.0,
+            use_mc_critic_pretrain=False,
+            use_online_bc=False,
+            use_online_critic_light_pretrain=False,
+            policy_update_start=params.policy_update_start,
+            alpha_update_start=params.policy_update_start,
+        )
+    if method == "sac_quality_aware":
+        # Minimal principled method + expert_state augmentation.
+        # The diagnostic showed the critic CAN'T fit Q(s, a) on a
+        # PID-expert dataset (RMSE/std ≈ 0.30) without the integrator
+        # state, but with [s, a, expert_state] it drops to ≈ 0.04. The
+        # policy needs the same state so it can represent the optimal
+        # action (which depends on the integrator). Asymmetric to
+        # `augment_obs_with_expert_action`: this exposes a STATE, not
+        # an ACTION, so it doesn't bias the policy toward copying the
+        # expert.
+        return dict(
+            expert_policy=expert_policy,
+            residual=False,
+            use_pid_policy=False,
+            use_expert_guidance=False,
+            use_expert_guided_exploration=True,
+            augment_obs_with_expert_action=False,
+            augment_obs_with_expert_state=True,
+            normalize_obs_running=True,
+            exploration_lcb=True,
+            exploration_thompson=False,
+            lcb_beta_init=params.lcb_beta_init,
+            lcb_beta_decay_k=2.0,
+            lcb_temperature=params.lcb_temperature,
+            epsilon_floor=0.0,         # no floor
+            target_entropy_initial_per_dim=None,
+            target_entropy_ramp_frac=0.5,  # unused when initial is None
+            pre_train_n_steps=0,
+            skip_actor_pretrain=True,
+            skip_critic_pretrain=True,
+            reset_log_std_after_bc=False,
+            reset_actor_head_after_bc=False,
+            expert_buffer_n_steps=0,
+            expert_mix_fraction=0.0,
+            # Disable competing EDGE flags
+            exploration_argmax=False,
+            exploration_boltzmann=False,
+            use_mc_critic_pretrain=False,
+            use_online_bc=False,
+            use_online_critic_light_pretrain=False,
+            use_critic_blend=False,
+            num_critic_updates=1,
+        )
+    if method == "pid_policy":
+        return dict(
+            expert_policy=expert_policy,
+            residual=False,
+            use_pid_policy=True,
+            use_expert_guidance=False,
+            use_expert_guided_exploration=False,
+            expert_buffer_n_steps=0,
+            expert_mix_fraction=0.0,
+            use_mc_critic_pretrain=False,
+            use_online_bc=False,
+            use_online_critic_light_pretrain=False,
+        )
+    if method == "td3":
+        # Vanilla TD3: no expert, default Gaussian exploration pipeline.
+        return dict(expert_policy=None)
+    if method in ("td3_edge", "td3_residual", "td3_ibrl", "td3_jsrl",
+                  "td3_quality_aware", "td3_always_expert"):
+        # The action_pipeline is built later in _construct_agent (where it
+        # has access to total_timesteps + params). Here we just signal that
+        # the variant uses the expert.
+        return dict(expert_policy=expert_policy)
+    raise ValueError(f"Unknown method {method!r}; supported: {SUPPORTED_METHODS}")
 
-    CUDA_VISIBLE_DEVICES is set in the environment by the master before
-    launching this subprocess.
+
+_CPG_EXPERT_FACTORIES = {
+    "cheetahrun": "make_cheetah_cpg_expert",
+    "barkourjoystick": "make_barkour_cpg_expert",
+}
+
+
+def _hpparams_from_dict(
+    best_params: dict,
+    method: str,
+    trial_number: int = -1,
+    n_timesteps: Optional[int] = None,
+) -> HPParams:
+    """Coerce an Optuna ``trial.params`` dict into a structured ``HPParams``.
+
+    Missing EDGE/JSRL fields are filled with ``None`` so downstream dispatch
+    falls back to ajax defaults. ``max_grad_norm`` is normalised from the
+    ``grad_clip`` categorical.
+
+    ``n_timesteps`` (optional) is the training budget this HPParams will be
+    used with. If provided and different from ``SEARCH_TIMESTEPS`` (the HPO
+    budget), fraction-based knobs that semantically encode an absolute
+    duration (``exploration_decay_frac``) are rescaled so absolute duration
+    is preserved. This lets HPO at 1M and final-eval at 2M share the same
+    effective decay window without re-running the search.
     """
-    import dill as pickle
-    from target_gym import Plane, PlaneParams
+    grad_clip = best_params.get("grad_clip", 0)
+    max_grad_norm = None if grad_clip in (0, None) else float(grad_clip)
 
-    from ajax import SAC
-    from ajax.logging.wandb_logging import LoggingConfig
-    from ajax.plane.plane_exps_utils import get_mode
+    decay_frac = best_params.get("exploration_decay_frac")
+    if decay_frac is not None and n_timesteps is not None and n_timesteps != SEARCH_TIMESTEPS:
+        abs_decay_steps = decay_frac * SEARCH_TIMESTEPS
+        decay_frac = abs_decay_steps / n_timesteps
 
-    tb = _tb_folder(params.trial_number, phase2=phase2)
-
-    env = Plane()
-    env_params = PlaneParams(
-        target_altitude_range=(3_000, 8_000),
-        initial_altitude_range=(3_000, 8_000),
-        max_steps_in_episode=10_000,
+    # SAC-only fields may be absent for TD3 trials; supply unused defaults.
+    is_td3 = _is_td3(method)
+    return HPParams(
+        trial_number=trial_number,
+        actor_lr=float(best_params["actor_lr"]),
+        critic_lr=float(best_params["critic_lr"]),
+        alpha_lr=float(best_params.get("alpha_lr", 1e-4)),
+        gamma=float(best_params["gamma"]),
+        tau=float(best_params["tau"]),
+        alpha_init=float(best_params.get("alpha_init", 1.0)),
+        target_entropy_per_dim=float(best_params.get("target_entropy_per_dim", -1.0)),
+        batch_size=int(best_params["batch_size"]),
+        arch_width=int(best_params["arch_width"]),
+        max_grad_norm=max_grad_norm,
+        method=method,
+        exploration_noise=(
+            float(best_params["exploration_noise"]) if is_td3 else None
+        ),
+        target_policy_noise=(
+            float(best_params["target_policy_noise"]) if is_td3 else None
+        ),
+        target_noise_clip=(
+            float(best_params["target_noise_clip"]) if is_td3 else None
+        ),
+        policy_delay=(
+            int(best_params["policy_delay"]) if is_td3 else None
+        ),
+        pre_train_n_steps=(
+            int(best_params["pre_train_n_steps"])
+            if "pre_train_n_steps" in best_params else None
+        ),
+        num_critics=(
+            int(best_params["num_critics"])
+            if "num_critics" in best_params else None
+        ),
+        qa_temperature=(
+            float(best_params["qa_temperature"])
+            if "qa_temperature" in best_params else None
+        ),
+        expert_buffer_n_steps=(
+            int(best_params["expert_buffer_n_steps"])
+            if "expert_buffer_n_steps" in best_params else None
+        ),
+        exploration_decay_frac=decay_frac,
+        exploration_tau=best_params.get("exploration_tau"),
+        fixed_exploration_prob=best_params.get("fixed_exploration_prob"),
+        policy_update_start=best_params.get("policy_update_start"),
     )
 
-    if os.path.exists("expert_policy.pkl"):
-        with open("expert_policy.pkl", "rb") as f:
-            expert_policy = pickle.load(f)
-    else:
-        expert_policy = env.expert_policy
-        with open("expert_policy.pkl", "wb") as f:
-            pickle.dump(expert_policy, f)
 
-    # Build LoggingConfig directly so we can set folder (get_log_config does
-    # not expose folder — it ends up in the config dict, not LoggingConfig.folder)
-    phase_tag = "_phase2" if phase2 else ""
-    logging_config = LoggingConfig(
-        project_name=PROJECT_NAME,
-        run_name=f"trial_{params.trial_number:03d}{phase_tag}",
-        config={
-            "debug": False,
-            "log_frequency": LOG_FREQUENCY,
-            "actor_lr": params.actor_lr,
-            "critic_lr": params.critic_lr,
-            "alpha_lr": params.alpha_lr,
-            "gamma": params.gamma,
-            "tau": params.tau,
-            "alpha_init": params.alpha_init,
-            "target_entropy_per_dim": params.target_entropy_per_dim,
-            "batch_size": params.batch_size,
-            "arch_width": params.arch_width,
-            "max_grad_norm": params.max_grad_norm,
-            "phase": 2 if phase2 else 1,
-        },
-        log_frequency=LOG_FREQUENCY,
-        horizon=10_000,
-        folder=tb,  # TensorBoard logs → tb/tensorboard/{run_id}/
-        use_tensorboard=True,
-        use_wandb=use_wandb,
-        sweep=False,
-    )
+def _construct_agent(method, env, env_params, expert_policy, params, method_kwargs,
+                     total_timesteps=None, n_envs=1, recurrent=False):
+    """Build either an SAC or TD3 agent from the resolved HPParams + method
+    kwargs. Centralizes the algo dispatch so build_agent_and_train and
+    run_worker stay in sync.
 
-    agent = SAC(
+    For TD3 variants (td3_edge / td3_residual / td3_ibrl / td3_jsrl), the
+    appropriate ``action_pipeline`` from ``td3_pipelines`` is constructed here
+    and passed to TD3, with ``total_timesteps`` bound into the schedule.
+    """
+    from ajax.agents.SAC.SAC import SAC  # local import to avoid module-level dep
+    if _is_td3(method):
+        from ajax.agents.TD3.TD3 import TD3
+        td3_kwargs = dict(method_kwargs)  # may contain action_pipeline
+        # Number of critics is configurable for quality_aware (where the
+        # disagreement signal is the whole method); other variants stay
+        # at TD3's default of 2.
+        if method == "td3_quality_aware" and params.num_critics is not None:
+            td3_kwargs["num_critics"] = int(params.num_critics)
+        if method != "td3":
+            # The variants need a custom action_pipeline. method_kwargs from
+            # _build_method_kwargs only carries expert_policy + the variant
+            # name; we resolve the pipeline here so we have access to params.
+            import td3_pipelines as tp
+            common = dict(
+                expert_policy=expert_policy, n_envs=n_envs,
+                recurrent=recurrent, exploration_noise=params.exploration_noise,
+            )
+            if method == "td3_edge":
+                pipeline = tp.make_edge_pipeline(
+                    **common,
+                    total_timesteps=total_timesteps,
+                    fixed_exploration_prob=params.fixed_exploration_prob,
+                    exploration_decay_frac=params.exploration_decay_frac,
+                    exploration_tau=params.exploration_tau,
+                )
+            elif method == "td3_residual":
+                pipeline = tp.make_residual_pipeline(**common)
+            elif method == "td3_ibrl":
+                pipeline = tp.make_ibrl_pipeline(**common)
+            elif method == "td3_jsrl":
+                pipeline = tp.make_jsrl_pipeline(
+                    **common,
+                    total_timesteps=total_timesteps,
+                    handoff_frac=params.exploration_decay_frac,
+                )
+            else:
+                raise ValueError(f"Unknown TD3 variant {method!r}")
+            td3_kwargs["action_pipeline"] = pipeline
+            td3_kwargs["expert_policy"] = expert_policy
+        return TD3(
+            env_id=env,
+            env_params=env_params,
+            actor_learning_rate=params.actor_lr,
+            critic_learning_rate=params.critic_lr,
+            gamma=params.gamma,
+            tau=params.tau,
+            batch_size=params.batch_size,
+            max_grad_norm=params.max_grad_norm,
+            actor_architecture=params.actor_architecture,
+            critic_architecture=params.critic_architecture,
+            policy_delay=params.policy_delay,
+            target_policy_noise=params.target_policy_noise,
+            target_noise_clip=params.target_noise_clip,
+            exploration_noise=params.exploration_noise,
+            **td3_kwargs,
+        )
+    sac_kwargs = dict(method_kwargs)
+    if params.num_critics is not None:
+        sac_kwargs["num_critics"] = int(params.num_critics)
+    return SAC(
         env_id=env,
         env_params=env_params,
         action_scale=1.0,
-        expert_policy=None,
-        eval_expert_policy=expert_policy,  # expert score in logs, no guidance
+        eval_expert_policy=expert_policy,
         actor_learning_rate=params.actor_lr,
         critic_learning_rate=params.critic_lr,
         alpha_learning_rate=params.alpha_lr,
@@ -324,13 +788,217 @@ def run_worker(
         max_grad_norm=params.max_grad_norm,
         actor_architecture=params.actor_architecture,
         critic_architecture=params.critic_architecture,
-        residual=False,
-        fixed_alpha=False,
-        # Vanilla SAC — all expert guidance off
-        use_expert_guidance=False,
-        expert_buffer_n_steps=0,
-        expert_mix_fraction=0.0,
-        use_mc_critic_pretrain=False,
+        **sac_kwargs,
+    )
+
+
+def build_agent_and_train(
+    env_name: str,
+    method: str,
+    best_params: dict,
+    seed_list: list,
+    n_timesteps: int,
+    checkpoint_path: Optional[str] = None,
+    expert_override: Optional[object] = None,
+    method_kwargs_override: Optional[dict] = None,
+    num_episode_test: int = None,
+):
+    """Build a SAC agent with ``best_params`` and train on ``seed_list`` seeds
+    for ``n_timesteps`` environment steps.
+
+    This is the reusable training path consumed by ``run_final_eval.py`` and
+    ``run_degradation_eval.py``. Mirrors ``run_worker``'s agent-construction
+    logic but without Optuna/HPO bookkeeping.
+
+    Parameters
+    ----------
+    env_name : str
+        One of the supported environments (Plane3DCircle, NuclearReactor,
+        FourTank, CheetahRun, BarkourJoystick, ...).
+    method : str
+        One of ``SUPPORTED_METHODS`` (sac, edge, residual, ibrl, pid_policy,
+        jsrl).
+    best_params : dict
+        Optuna ``trial.params`` dictionary from the HPO study.
+    seed_list : list[int]
+        Training seeds (final eval typically uses 100 fresh seeds).
+    n_timesteps : int
+        Total environment steps per seed.
+    checkpoint_path : str, optional
+        If provided and the file exists, resume from that checkpoint. After
+        training, the final state is saved to the same path (atomic write).
+    expert_override : object, optional
+        If provided, replace the env-default expert with this
+        ``FunctionalExpertPolicy`` (used by degradation study).
+    num_episode_test : int, optional
+        Number of evaluation episodes between log checkpoints. Defaults to
+        the module-level ``NUM_EPISODE_TEST``.
+
+    Returns
+    -------
+    A 3-tuple ``(state, run_ids, tb_folder)``: the train() result, the per-seed
+    TB run identifiers, and the directory containing the TB events. The caller
+    can pass ``run_ids`` and ``tb_folder`` to ``read_final_metric`` to compute
+    the actual evaluation score from the on-disk TB logs (since ``state`` no
+    longer carries per-step metrics after the Ajax scan-ys removal).
+    """
+    from ajax.agents.SAC.SAC import SAC
+    from ajax.checkpoint import (
+        checkpoint_exists,
+        restore_into,
+        save_checkpoint,
+    )
+    from ajax.logging.wandb_logging import LoggingConfig
+
+    if num_episode_test is None:
+        num_episode_test = NUM_EPISODE_TEST
+
+    env, env_params = make_env_by_name(env_name)
+    expert_policy = (
+        expert_override
+        if expert_override is not None
+        else _load_expert_policy(env_name, env)
+    )
+    params = _hpparams_from_dict(
+        best_params, method=method, n_timesteps=n_timesteps
+    )
+    method_kwargs = _build_method_kwargs(method, expert_policy, params)
+    if method_kwargs_override:
+        method_kwargs = {**method_kwargs, **method_kwargs_override}
+
+    logging_config = LoggingConfig(
+        project_name=_project_name(env_name, method),
+        run_name=f"final_eval_{method}",
+        config={"method": method, "mode": "final_eval", **best_params},
+        log_frequency=LOG_FREQUENCY,
+        horizon=10_000,
+        folder=str(FINAL_RESULTS_TB_DIR(env_name, method)),
+        use_tensorboard=True,
+        use_wandb=False,
+        sweep=False,
+    )
+
+    agent = _construct_agent(
+        method, env, env_params, expert_policy, params, method_kwargs,
+        total_timesteps=n_timesteps,
+    )
+
+    initial_state = None
+    if checkpoint_path is not None and checkpoint_exists(checkpoint_path):
+        # Resume: load into a freshly-initialised skeleton.
+        skeleton = agent.train(
+            seed=seed_list,
+            n_timesteps=1,  # near-zero compute, just to build state
+            num_episode_test=1,
+        )
+        initial_state = restore_into(skeleton, checkpoint_path)
+
+    result = agent.train(
+        seed=seed_list,
+        logging_config=logging_config,
+        n_timesteps=n_timesteps,
+        num_episode_test=num_episode_test,
+        initial_state=initial_state,
+    )
+
+    if checkpoint_path is not None:
+        save_checkpoint(result, checkpoint_path)
+
+    return result, list(agent.run_ids), str(FINAL_RESULTS_TB_DIR(env_name, method))
+
+
+def FINAL_RESULTS_TB_DIR(env_name: str, method: str) -> Path:
+    p = Path(__file__).resolve().parent / "final_results_tb" / env_name.lower() / method
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _load_expert_policy(env_name: str, env):
+    """Load the cached expert pickle if present, else construct the expert.
+
+    For TargetGym-native envs we fall back to ``env.expert_policy``.
+    For Mujoco Playground locomotion envs we use a CPG factory from
+    ``target_gym.experts.cpg`` (CheetahRun, BarkourJoystick).
+    """
+    import pickle
+
+    pkl = Path(f"expert_policy_{env_name.lower()}.pkl")
+    if pkl.exists():
+        with open(pkl, "rb") as f:
+            return pickle.load(f)
+
+    key = env_name.lower()
+    if key in _CPG_EXPERT_FACTORIES:
+        import target_gym.experts.cpg as cpg_mod
+        factory = getattr(cpg_mod, _CPG_EXPERT_FACTORIES[key])
+        return factory()
+
+    return env.expert_policy
+
+
+def run_worker(
+    params: HPParams,
+    n_timesteps: int,
+    n_seeds: int,
+    env_name: str,
+    phase2: bool = False,
+    method: str = "sac",
+    eval_window: int = SEARCH_EVAL_WINDOW,
+) -> None:
+    """
+    Runs inside a subprocess.  JAX (and GPU allocation) is initialised here,
+    not in the master, so each worker gets a clean CUDA context.
+
+    CUDA_VISIBLE_DEVICES is set in the environment by the master before
+    launching this subprocess.
+    """
+    from ajax import SAC
+    from ajax.logging.wandb_logging import LoggingConfig
+    from ajax.plane.plane_exps_utils import get_mode
+
+    tb = _tb_folder(params.trial_number, env_name, phase2=phase2, method=method)
+
+    env, env_params = make_env_by_name(env_name)
+
+    expert_policy = _load_expert_policy(env_name, env)
+
+    method_kwargs = _build_method_kwargs(method, expert_policy, params)
+
+    phase_tag = "_phase2" if phase2 else ""
+    logging_config = LoggingConfig(
+        project_name=_project_name(env_name, method),
+        run_name=f"trial_{params.trial_number:03d}{phase_tag}",
+        config={
+            "debug": False,
+            "method": method,
+            "log_frequency": LOG_FREQUENCY,
+            "actor_lr": params.actor_lr,
+            "critic_lr": params.critic_lr,
+            "alpha_lr": params.alpha_lr,
+            "gamma": params.gamma,
+            "tau": params.tau,
+            "alpha_init": params.alpha_init,
+            "target_entropy_per_dim": params.target_entropy_per_dim,
+            "batch_size": params.batch_size,
+            "arch_width": params.arch_width,
+            "max_grad_norm": params.max_grad_norm,
+            "exploration_decay_frac": params.exploration_decay_frac,
+            "exploration_tau": params.exploration_tau,
+            "fixed_exploration_prob": params.fixed_exploration_prob,
+            "policy_update_start": params.policy_update_start,
+            "phase": 2 if phase2 else 1,
+        },
+        log_frequency=LOG_FREQUENCY,
+        horizon=10_000,
+        folder=tb,
+        use_tensorboard=True,
+        use_wandb=False,
+        sweep=False,
+    )
+
+    agent = _construct_agent(
+        method, env, env_params, expert_policy, params, method_kwargs,
+        total_timesteps=n_timesteps,
     )
 
     mode = get_mode()
@@ -363,10 +1031,12 @@ def run_worker(
         )
 
     elapsed = time.time() - t0
+    # Single-phase search: always evaluate on a trailing window so the metric
+    # mirrors the ablation's last-N-steps average (stable, not noisy last tick).
     metric = read_final_metric(
         tb,
         agent.run_ids,
-        window_steps=PHASE2_EVAL_WINDOW if phase2 else None,
+        window_steps=eval_window,
     )
     print(
         f"[trial {params.trial_number:03d}] done  metric={metric:.2f}  "
@@ -381,7 +1051,9 @@ def run_worker(
         "tb_folder": tb,
         "phase": 2 if phase2 else 1,
     }
-    with open(_result_path(params.trial_number, phase2=phase2), "w") as f:
+    with open(
+        _result_path(params.trial_number, env_name, phase2=phase2, method=method), "w"
+    ) as f:
         json.dump(result, f, indent=2)
 
 
@@ -403,11 +1075,78 @@ def _get_gpu_ids(requested: Optional[List[int]] = None) -> List[int]:
     return [int(ln.strip()) for ln in result.stdout.strip().splitlines() if ln.strip()]
 
 
-def _create_or_load_study():
+_GPU_CHECK_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "GPU_check.sh"
+)
+
+
+def _gpu_check_free_set() -> Optional[set]:
+    """Return the set of GPU ids currently FREE per GPU_check.sh.
+
+    GPU_check.sh enforces SMACT (compute), DRAMA (memory bandwidth), free
+    VRAM, and per-GPU CUDA context count — a GPU is FREE only if all four
+    are permissive. Returns None if the check could not be run (in which
+    case callers should fail-open).
+    """
+    try:
+        result = subprocess.run(
+            ["bash", _GPU_CHECK_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if line.startswith("Recommended: GPU "):
+            after = line[len("Recommended: GPU ") :].split("(", 1)[0].strip()
+            return {int(tok) for tok in after.split() if tok.isdigit()}
+        if line.startswith("No fully-free GPU"):
+            return set()
+    return set()
+
+
+def _gpu_is_claimable(
+    gpu_id: int,
+    running: Dict[int, "Optional[RunningJob]"],
+    _cache: Dict[str, object] = {},
+    _cache_ttl_s: float = 20.0,
+) -> bool:
+    """Can the master safely spawn a new worker on gpu_id?
+
+    Uses GPU_check.sh (SMACT + DRAMA + VRAM + context count) so external
+    processes competing for the GPU block our spawn. Our own running
+    workers are tolerated: if gpu_id is in `running`, we grant it.
+
+    Result is cached for ~20 s to avoid burning 3 s on dcgmi for each poll
+    cycle per GPU in the spawn loop.
+    """
+    # Tolerate our own workers: if we already have a worker on this GPU the
+    # slot is "taken" from the master's perspective and we never try to
+    # double-spawn anyway, but grant the check so callers don't get confused.
+    if running.get(gpu_id) is not None:
+        return True
+
+    now = time.time()
+    last_ts = _cache.get("ts", 0.0)
+    if now - last_ts > _cache_ttl_s or "set" not in _cache:
+        _cache["set"] = _gpu_check_free_set()
+        _cache["ts"] = now
+    free_set = _cache["set"]
+    if free_set is None:
+        return True  # fail-open: check unavailable
+    return gpu_id in free_set
+
+
+def _create_or_load_study(env_name: str, method: str = "sac", enable_prune: bool = True):
     import optuna
     from optuna.samplers import TPESampler
+    from optuna.pruners import MedianPruner, NopPruner
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    _results_dir(env_name, method).mkdir(parents=True, exist_ok=True)
 
     sampler = TPESampler(
         n_startup_trials=10,  # first 10 trials are purely random (cold start)
@@ -416,11 +1155,21 @@ def _create_or_load_study():
         # the current best so next suggestions aren't clones
         multivariate=True,  # model cross-parameter correlations (e.g. lr × γ)
     )
+    if enable_prune:
+        # n_warmup_steps is enforced master-side (we only call trial.report
+        # once last_step >= PRUNE_WARMUP_STEPS), so leave it at 0 here.
+        pruner = MedianPruner(
+            n_startup_trials=PRUNE_N_STARTUP_TRIALS,
+            n_warmup_steps=0,
+        )
+    else:
+        pruner = NopPruner()
     study = optuna.create_study(
-        study_name=STUDY_NAME,
-        storage=f"sqlite:///{DB_PATH}",
+        study_name=_study_name(env_name, method),
+        storage=f"sqlite:///{_db_path(env_name, method)}",
         direction="maximize",
         sampler=sampler,
+        pruner=pruner,
         load_if_exists=True,
     )
     return study
@@ -432,7 +1181,7 @@ def _fix_stale_running_trials(study) -> int:
     fixed = 0
     for t in study.trials:
         if t.state == optuna.trial.TrialState.RUNNING:
-            study.tell(t, state=optuna.trial.TrialState.FAIL)
+            study.tell(t.number, state=optuna.trial.TrialState.FAIL)
             fixed += 1
     if fixed:
         print(f"[master] Marked {fixed} stale RUNNING trial(s) as FAILED.")
@@ -446,6 +1195,75 @@ class RunningJob:
     process: subprocess.Popen
     optuna_trial: object  # optuna.Trial
     log_file: object
+    pruned: bool = False
+    reported_buckets: set = None
+
+    def __post_init__(self):
+        if self.reported_buckets is None:
+            self.reported_buckets = set()
+
+
+def _poll_trial_progress(
+    tb_folder: str, window_steps: int
+) -> Tuple[Optional[int], Optional[float]]:
+    """Parse a trial's in-flight TB event files and return
+    (last_step, trailing_mean_reward_across_seeds) or (None, None) if no eval
+    scalars are available yet.
+
+    Uses raw protobuf parsing (tensorboardX only, no tensorflow dep).
+    """
+    import struct
+    import glob
+    from tensorboardX.proto import event_pb2
+
+    seed_dirs = sorted(glob.glob(os.path.join(tb_folder, "tensorboard", "*")))
+    if not seed_dirs:
+        return None, None
+
+    seed_last_steps = []
+    seed_trailing_means = []
+    for seed_dir in seed_dirs:
+        events_files = sorted(glob.glob(os.path.join(seed_dir, "events.out.*")))
+        if not events_files:
+            continue
+        eval_entries: list = []  # (step, value) for EVAL_TAG
+        for path in events_files:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+            except OSError:
+                continue
+            i = 0
+            while i < len(data):
+                if len(data) - i < 12:
+                    break
+                (length,) = struct.unpack("<Q", data[i : i + 8])
+                i += 12
+                if len(data) - i < length + 4:
+                    break
+                payload = data[i : i + length]
+                i += length + 4
+                try:
+                    ev = event_pb2.Event.FromString(payload)
+                except Exception:
+                    break
+                for v in ev.summary.value:
+                    if v.tag == EVAL_TAG:
+                        eval_entries.append((int(ev.step), float(v.simple_value)))
+        if not eval_entries:
+            continue
+        eval_entries.sort()
+        last_step = eval_entries[-1][0]
+        window = [val for st, val in eval_entries if st >= last_step - window_steps]
+        if not window:
+            continue
+        seed_last_steps.append(last_step)
+        seed_trailing_means.append(sum(window) / len(window))
+
+    if not seed_trailing_means:
+        return None, None
+    # All seeds step in lockstep (vmapped), so min == max in practice.
+    return min(seed_last_steps), sum(seed_trailing_means) / len(seed_trailing_means)
 
 
 def _spawn_worker(
@@ -453,8 +1271,10 @@ def _spawn_worker(
     gpu_id: int,
     n_timesteps: int,
     n_seeds: int,
-    use_wandb: bool,
+    env_name: str,
     phase2: bool = False,
+    method: str = "sac",
+    eval_window: int = SEARCH_EVAL_WINDOW,
 ) -> subprocess.Popen:
     """Launch one trial as a subprocess on gpu_id."""
     env = os.environ.copy()
@@ -465,19 +1285,23 @@ def _spawn_worker(
         sys.executable,
         __file__,
         "--worker",
+        "--env",
+        env_name,
+        "--method",
+        method,
         "--trial-number",
         str(params.trial_number),
         "--n-timesteps",
         str(n_timesteps),
         "--n-seeds",
         str(n_seeds),
+        "--eval-window",
+        str(eval_window),
     ]
     if phase2:
         cmd.append("--phase2-worker")
-    if not use_wandb:
-        cmd.append("--no-wandb")
 
-    log = open(_log_path(params.trial_number, phase2=phase2), "w")
+    log = open(_log_path(params.trial_number, env_name, phase2=phase2, method=method), "w")
     proc = subprocess.Popen(
         cmd,
         env=env,
@@ -494,31 +1318,45 @@ def run_master(
     n_timesteps: int,
     n_seeds: int,
     poll_interval: int,
-    use_wandb: bool,
+    env_name: str,
+    method: str = "sac",
+    eval_window: int = SEARCH_EVAL_WINDOW,
+    enable_prune: bool = PRUNE_ENABLED_DEFAULT,
+    prune_warmup_steps: int = PRUNE_WARMUP_STEPS,
+    prune_interval_steps: int = PRUNE_INTERVAL_STEPS,
 ) -> None:
     import optuna
 
-    study = _create_or_load_study()
+    study = _create_or_load_study(env_name, method, enable_prune=enable_prune)
     _fix_stale_running_trials(study)
 
-    n_complete = sum(
-        1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
-    )
+    # Pruned trials count toward the budget: they consumed an Optuna suggestion.
+    _DONE_STATES = {
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.PRUNED,
+    }
+
+    n_complete = sum(1 for t in study.trials if t.state in _DONE_STATES)
     pending = n_trials - n_complete
     if pending <= 0:
         print(f"All {n_trials} trials already complete.  Run --results to view.")
         return
 
-    print(f"\nPhase 1 — exploration: {pending} trials remaining  |  GPUs: {gpu_ids}")
+    print(
+        f"\nSingle-phase search [{method}]: {pending} trials remaining  |  "
+        f"env={env_name}  |  GPUs: {gpu_ids}"
+    )
     print(f"Budget: {n_timesteps:,} steps × {n_seeds} seeds per trial")
-    print(f"Study DB: {DB_PATH}   (kill/relaunch safely at any time)\n")
+    print(
+        f"Study DB: {_db_path(env_name, method)}   (kill/relaunch safely at any time)\n"
+    )
 
     running: Dict[int, Optional[RunningJob]] = {g: None for g in gpu_ids}
 
     from tqdm import tqdm
 
     progress = tqdm(
-        total=n_trials, initial=n_complete, desc="Phase 1 trials", unit="trial"
+        total=n_trials, initial=n_complete, desc=f"{method} trials", unit="trial"
     )
 
     try:
@@ -532,17 +1370,21 @@ def run_master(
                     continue
 
                 job.log_file.close()
-                rp = _result_path(job.trial_number)
+                rp = _result_path(job.trial_number, env_name, method=method)
 
-                if ret == 0 and rp.exists():
+                if job.pruned:
+                    # Already told PRUNED at SIGTERM time; just reap.
+                    progress.update(1)
+                    n_done = sum(1 for t in study.trials if t.state in _DONE_STATES)
+                    tqdm.write(
+                        f"  [GPU {gpu_id}] ✂ trial {job.trial_number:03d} "
+                        f"pruned  ({n_done}/{n_trials} done)"
+                    )
+                elif ret == 0 and rp.exists():
                     with open(rp) as f:
                         metric = json.load(f)["metric"]
                     study.tell(job.optuna_trial, metric)
-                    n_done = sum(
-                        1
-                        for t in study.trials
-                        if t.state == optuna.trial.TrialState.COMPLETE
-                    )
+                    n_done = sum(1 for t in study.trials if t.state in _DONE_STATES)
                     best = study.best_trial
                     progress.update(1)
                     progress.set_postfix(
@@ -557,15 +1399,44 @@ def run_master(
                     tqdm.write(
                         f"  [GPU {gpu_id}] ✗ trial {job.trial_number:03d}  "
                         f"exit={ret} — marked FAILED  (log: "
-                        f"{_log_path(job.trial_number)})"
+                        f"{_log_path(job.trial_number, env_name, method=method)})"
                     )
 
                 running[gpu_id] = None
 
+            # ── Poll running workers for async pruning ───────────────────
+            if enable_prune:
+                for gpu_id, job in running.items():
+                    if job is None or job.pruned:
+                        continue
+                    tb = _tb_folder(job.trial_number, env_name, method=method)
+                    last_step, trailing_mean = _poll_trial_progress(
+                        tb, window_steps=eval_window
+                    )
+                    if last_step is None or last_step < prune_warmup_steps:
+                        continue
+                    bucket = (last_step // prune_interval_steps) * prune_interval_steps
+                    if bucket in job.reported_buckets:
+                        continue
+                    job.reported_buckets.add(bucket)
+                    job.optuna_trial.report(trailing_mean, bucket)
+                    if job.optuna_trial.should_prune():
+                        try:
+                            os.killpg(os.getpgid(job.process.pid), 15)
+                        except ProcessLookupError:
+                            pass
+                        study.tell(
+                            job.optuna_trial,
+                            state=optuna.trial.TrialState.PRUNED,
+                        )
+                        job.pruned = True
+                        tqdm.write(
+                            f"  [GPU {gpu_id}] ✂ trial {job.trial_number:03d} "
+                            f"PRUNE @ step {bucket:,}  trailing={trailing_mean:.2f}"
+                        )
+
             # ── Check completion ──────────────────────────────────────────
-            n_done = sum(
-                1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE
-            )
+            n_done = sum(1 for t in study.trials if t.state in _DONE_STATES)
             if n_done >= n_trials and all(j is None for j in running.values()):
                 break
 
@@ -575,25 +1446,29 @@ def run_master(
                     continue
 
                 in_flight = sum(1 for j in running.values() if j is not None)
-                n_done = sum(
-                    1
-                    for t in study.trials
-                    if t.state == optuna.trial.TrialState.COMPLETE
-                )
+                n_done = sum(1 for t in study.trials if t.state in _DONE_STATES)
                 if n_done + in_flight >= n_trials:
                     break
 
+                # Skip GPUs that are currently occupied by an external process
+                # (another HPO, another user). We keep polling each cycle, so
+                # once the external job releases the GPU we pick it up.
+                if not _gpu_is_claimable(gpu_id, running):
+                    continue
+
                 optuna_trial = study.ask()
-                params = suggest_params(optuna_trial)
+                params = suggest_params(optuna_trial, method=method)
                 params.trial_number = optuna_trial.number
-                params.to_json(_params_path(params.trial_number))
+                params.to_json(_params_path(params.trial_number, env_name, method=method))
 
                 proc, log = _spawn_worker(
                     params=params,
                     gpu_id=gpu_id,
                     n_timesteps=n_timesteps,
                     n_seeds=n_seeds,
-                    use_wandb=use_wandb,
+                    env_name=env_name,
+                    method=method,
+                    eval_window=eval_window,
                 )
                 running[gpu_id] = RunningJob(
                     trial_number=params.trial_number,
@@ -625,7 +1500,7 @@ def run_master(
         sys.exit(1)
 
     progress.close()
-    print_results(study)
+    print_results(env_name, study, method=method)
 
 
 # ---------------------------------------------------------------------------
@@ -633,12 +1508,12 @@ def run_master(
 # ---------------------------------------------------------------------------
 
 
-def run_phase2(top_k: int, gpu_ids: List[int], use_wandb: bool) -> None:
+def run_phase2(top_k: int, gpu_ids: List[int], env_name: str, method: str = "sac") -> None:
     """Run top-K Phase 1 configs at full budget in parallel across GPUs."""
     import optuna
     from tqdm import tqdm
 
-    study = _create_or_load_study()
+    study = _create_or_load_study(env_name, method)
     complete = sorted(
         [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE],
         key=lambda t: t.value,
@@ -651,17 +1526,18 @@ def run_phase2(top_k: int, gpu_ids: List[int], use_wandb: bool) -> None:
     top = complete[:top_k]
     print(
         f"\nPhase 2 — confirmation: top-{len(top)} configs × "
-        f"{PHASE2_TIMESTEPS:,} steps × {PHASE2_SEEDS} seeds  |  GPUs: {gpu_ids}\n"
+        f"{PHASE2_TIMESTEPS:,} steps × {PHASE2_SEEDS} seeds  |  "
+        f"env={env_name}  |  GPUs: {gpu_ids}\n"
     )
 
     # Separate already-cached trials from those that need running
     queue: deque = deque()
     for rank, trial in enumerate(top, 1):
-        pp = _params_path(trial.number)
+        pp = _params_path(trial.number, env_name, method=method)
         if not pp.exists():
             tqdm.write(f"  [skip] trial {trial.number:03d} — params file missing")
             continue
-        rp = _result_path(trial.number, phase2=True)
+        rp = _result_path(trial.number, env_name, phase2=True, method=method)
         if rp.exists():
             with open(rp) as f:
                 cached = json.load(f)
@@ -674,7 +1550,7 @@ def run_phase2(top_k: int, gpu_ids: List[int], use_wandb: bool) -> None:
 
     if not queue:
         print("All Phase 2 trials already cached.")
-        _print_phase2_summary(top)
+        _print_phase2_summary(top, env_name, method=method)
         return
 
     running: Dict[int, Optional[RunningJob]] = {g: None for g in gpu_ids}
@@ -695,7 +1571,7 @@ def run_phase2(top_k: int, gpu_ids: List[int], use_wandb: bool) -> None:
                 if ret is None:
                     continue
                 job.log_file.close()
-                rp = _result_path(job.trial_number, phase2=True)
+                rp = _result_path(job.trial_number, env_name, phase2=True, method=method)
                 if ret == 0 and rp.exists():
                     with open(rp) as f:
                         r = json.load(f)
@@ -710,7 +1586,8 @@ def run_phase2(top_k: int, gpu_ids: List[int], use_wandb: bool) -> None:
                 else:
                     tqdm.write(
                         f"  [GPU {gpu_id}] ✗ trial {job.trial_number:03d}  "
-                        f"exit={ret} — see {_log_path(job.trial_number, phase2=True)}"
+                        f"exit={ret} — see "
+                        f"{_log_path(job.trial_number, env_name, phase2=True, method=method)}"
                     )
                 running[gpu_id] = None
 
@@ -719,7 +1596,9 @@ def run_phase2(top_k: int, gpu_ids: List[int], use_wandb: bool) -> None:
                 if running[gpu_id] is not None or not queue:
                     continue
                 rank, trial = queue.popleft()
-                params = HPParams.from_json(_params_path(trial.number))
+                params = HPParams.from_json(
+                    _params_path(trial.number, env_name, method=method)
+                )
                 tqdm.write(
                     f"  [GPU {gpu_id}] → trial {trial.number:03d}  "
                     f"Phase1={trial.value:.2f}"
@@ -729,8 +1608,9 @@ def run_phase2(top_k: int, gpu_ids: List[int], use_wandb: bool) -> None:
                     gpu_id=gpu_id,
                     n_timesteps=PHASE2_TIMESTEPS,
                     n_seeds=PHASE2_SEEDS,
-                    use_wandb=use_wandb,
+                    env_name=env_name,
                     phase2=True,
+                    method=method,
                 )
                 running[gpu_id] = RunningJob(
                     trial_number=trial.number,
@@ -753,19 +1633,19 @@ def run_phase2(top_k: int, gpu_ids: List[int], use_wandb: bool) -> None:
         sys.exit(1)
 
     progress.close()
-    _print_phase2_summary(top)
+    _print_phase2_summary(top, env_name, method=method)
 
 
-def _print_phase2_summary(top) -> None:
+def _print_phase2_summary(top, env_name: str, method: str = "sac") -> None:
     """Print a ranked table of Phase 2 results."""
     print(f"\n{'='*60}")
-    print("Phase 2 summary")
+    print(f"Phase 2 summary  env={env_name}")
     print(f"{'='*60}")
     print(f"{'Rank':>4}  {'Trial':>5}  {'Phase1':>8}  {'Phase2':>8}")
     print("-" * 60)
     results = []
     for rank, trial in enumerate(top, 1):
-        rp = _result_path(trial.number, phase2=True)
+        rp = _result_path(trial.number, env_name, phase2=True, method=method)
         if rp.exists():
             with open(rp) as f:
                 r = json.load(f)
@@ -779,14 +1659,20 @@ def _print_phase2_summary(top) -> None:
     best = next((r for r in results if r[0] != float("-inf")), None)
     if best:
         print(f"\nBest Phase 2: trial #{best[1]}  score={best[0]:.2f}")
-        _save_best_to_yaml(best[1])
+        _save_best_to_yaml(best[1], env_name, method=method)
 
 
-def _save_best_to_yaml(trial_number: int) -> None:
-    """Write the best trial's hyperparameters into hyperparams/ajax_sac.yml."""
+def _save_best_to_yaml(trial_number: int, env_name: str, method: str = "sac") -> None:
+    """Persist the best trial's HPs.
+
+    For method=="sac": writes hyperparams/ajax_sac.yml under env_name (legacy path
+    consumed by load_hyperparams). For other methods: writes a sibling file
+    hyperparams/ajax_sac_<method>.yml so each method's search result is
+    recoverable without overwriting SAC's tuned base HPs.
+    """
     import yaml
 
-    pp = _params_path(trial_number)
+    pp = _params_path(trial_number, env_name, method=method)
     if not pp.exists():
         print(
             f"[save] params file missing for trial {trial_number:03d}, skipping YAML save."
@@ -794,16 +1680,17 @@ def _save_best_to_yaml(trial_number: int) -> None:
         return
 
     params = HPParams.from_json(pp)
-    yaml_path = Path("hyperparams/ajax_sac.yml")
+    import ajax as _ajax_pkg
+    yaml_name = "ajax_sac.yml" if method == "sac" else f"ajax_sac_{method}.yml"
+    yaml_path = Path(_ajax_pkg.__file__).parents[2] / "hyperparams" / yaml_name
 
-    # Load existing file to preserve other environments
     if yaml_path.exists():
         with open(yaml_path) as f:
             cfg = yaml.safe_load(f) or {}
     else:
         cfg = {}
 
-    cfg["Plane"] = {
+    entry = {
         "actor_learning_rate": params.actor_lr,
         "critic_learning_rate": params.critic_lr,
         "alpha_learning_rate": params.alpha_lr,
@@ -815,12 +1702,21 @@ def _save_best_to_yaml(trial_number: int) -> None:
         "arch_width": params.arch_width,
         "max_grad_norm": params.max_grad_norm,
     }
+    if method == "edge":
+        entry.update({
+            "exploration_decay_frac": params.exploration_decay_frac,
+            "exploration_tau": params.exploration_tau,
+            "fixed_exploration_prob": params.fixed_exploration_prob,
+            "policy_update_start": params.policy_update_start,
+        })
+    cfg[env_name] = entry
 
     yaml_path.parent.mkdir(parents=True, exist_ok=True)
     with open(yaml_path, "w") as f:
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
     print(
-        f"[save] Best hyperparameters written to {yaml_path}  (trial #{trial_number})"
+        f"[save] Best hyperparameters for env {env_name!r} (method={method}) "
+        f"written to {yaml_path}  (trial #{trial_number})"
     )
 
 
@@ -829,11 +1725,11 @@ def _save_best_to_yaml(trial_number: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def print_results(study=None) -> None:
+def print_results(env_name: str, study=None, method: str = "sac") -> None:
     import optuna
 
     if study is None:
-        study = _create_or_load_study()
+        study = _create_or_load_study(env_name, method)
 
     complete = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     failed = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
@@ -845,7 +1741,10 @@ def print_results(study=None) -> None:
     ranked = sorted(complete, key=lambda t: t.value, reverse=True)
 
     print(f"\n{'='*105}")
-    print(f"Phase 1 results: {len(complete)} completed, {len(failed)} failed")
+    print(
+        f"Results env={env_name}  method={method}: "
+        f"{len(complete)} completed, {len(failed)} failed"
+    )
     print(f"{'='*105}")
     hdr = (
         f"{'Rank':>4}  {'#':>5}  {'Score':>8}  "
@@ -876,8 +1775,7 @@ def print_results(study=None) -> None:
     best = ranked[0]
     print(f"\nBest: trial #{best.number}  score={best.value:.2f}")
     print(json.dumps(best.params, indent=4))
-    print("\nTo confirm top-5 at full budget:")
-    print("  python hyperparam_search.py --phase2 --top-k 5")
+    _save_best_to_yaml(best.number, env_name, method=method)
 
 
 # ---------------------------------------------------------------------------
@@ -887,7 +1785,10 @@ def print_results(study=None) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Bayesian HPO for vanilla SAC on the Plane environment."
+        description=(
+            "Bayesian HPO for SAC and its expert-assisted variants. "
+            "Single-phase symmetric protocol (--method picks the variant)."
+        )
     )
 
     # Worker flags (hidden — called internally by master)
@@ -897,13 +1798,33 @@ def main() -> None:
         "--trial-number", type=int, default=None, help=argparse.SUPPRESS
     )
     parser.add_argument(
-        "--n-timesteps", type=int, default=PHASE1_TIMESTEPS, help=argparse.SUPPRESS
+        "--n-timesteps", type=int, default=SEARCH_TIMESTEPS, help=argparse.SUPPRESS
     )
     parser.add_argument(
-        "--n-seeds", type=int, default=PHASE1_SEEDS, help=argparse.SUPPRESS
+        "--n-seeds", type=int, default=SEARCH_SEEDS, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        "--eval-window", type=int, default=SEARCH_EVAL_WINDOW, help=argparse.SUPPRESS
     )
 
     # Master / user flags
+    parser.add_argument(
+        "--env",
+        type=str,
+        default="Plane",
+        help="TargetGym environment to run the HP search against (default: Plane).",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="sac",
+        choices=SUPPORTED_METHODS,
+        help=(
+            "Which variant to tune. 'sac' = vanilla; 'edge' adds expert-guided "
+            "exploration + 4 method-specific dims; 'residual', 'ibrl', "
+            "'pid_policy' inherit the same 10-dim base search."
+        ),
+    )
     parser.add_argument(
         "--gpus",
         nargs="+",
@@ -912,7 +1833,31 @@ def main() -> None:
         help="GPU IDs to use (default: all detected by nvidia-smi).",
     )
     parser.add_argument(
-        "--trials", type=int, default=50, help="Total Phase 1 trials (default: 40)."
+        "--trials",
+        type=int,
+        default=SEARCH_TRIALS,
+        help=f"Total trials (default: {SEARCH_TRIALS}).",
+    )
+    parser.add_argument(
+        "--search-timesteps",
+        type=int,
+        default=SEARCH_TIMESTEPS,
+        help=f"Env steps per trial (default: {SEARCH_TIMESTEPS}).",
+    )
+    parser.add_argument(
+        "--search-seeds",
+        type=int,
+        default=SEARCH_SEEDS,
+        help=f"Seeds per trial (default: {SEARCH_SEEDS}).",
+    )
+    parser.add_argument(
+        "--search-eval-window",
+        type=int,
+        default=SEARCH_EVAL_WINDOW,
+        help=(
+            "Trailing-window size (env steps) over which the eval metric is "
+            f"averaged when scoring a trial (default: {SEARCH_EVAL_WINDOW})."
+        ),
     )
     parser.add_argument(
         "--poll",
@@ -920,7 +1865,29 @@ def main() -> None:
         default=30,
         help="Master poll interval in seconds (default: 30).",
     )
-    parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging.")
+    parser.add_argument(
+        "--no-prune",
+        action="store_true",
+        help="Disable async median pruning (run all trials to full budget).",
+    )
+    parser.add_argument(
+        "--prune-warmup-steps",
+        type=int,
+        default=PRUNE_WARMUP_STEPS,
+        help=(
+            "No pruning decision before this env-step count "
+            f"(default: {PRUNE_WARMUP_STEPS:,})."
+        ),
+    )
+    parser.add_argument(
+        "--prune-interval-steps",
+        type=int,
+        default=PRUNE_INTERVAL_STEPS,
+        help=(
+            "Re-evaluate prune decision every N steps "
+            f"(default: {PRUNE_INTERVAL_STEPS:,})."
+        ),
+    )
     parser.add_argument(
         "--results", action="store_true", help="Print ranked results table and exit."
     )
@@ -930,7 +1897,7 @@ def main() -> None:
     parser.add_argument(
         "--phase2",
         action="store_true",
-        help="Run Phase 2 confirmation for top-K configs.",
+        help="Run Phase 2 confirmation for top-K configs (legacy, not auto-run).",
     )
     parser.add_argument(
         "--top-k",
@@ -940,13 +1907,12 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    use_wandb = not args.no_wandb
 
     # ── Worker subprocess ─────────────────────────────────────────────────
     if args.worker:
         if args.trial_number is None:
             sys.exit("--trial-number required in --worker mode")
-        pp = _params_path(args.trial_number)
+        pp = _params_path(args.trial_number, args.env, method=args.method)
         if not pp.exists():
             sys.exit(f"Params file not found: {pp}")
         params = HPParams.from_json(pp)
@@ -954,8 +1920,10 @@ def main() -> None:
             params=params,
             n_timesteps=args.n_timesteps,
             n_seeds=args.n_seeds,
-            use_wandb=use_wandb,
+            env_name=args.env,
             phase2=args.phase2_worker,
+            method=args.method,
+            eval_window=args.eval_window,
         )
         return
 
@@ -967,56 +1935,83 @@ def main() -> None:
             sampler=optuna.samplers.TPESampler(seed=42),
             direction="maximize",
         )
-        print("\nSearch space (10 random samples from TPE cold start):\n")
+        print(f"\nSearch space for method={args.method!r} "
+              "(10 random samples from TPE cold start):\n")
         hdr = (
             f"{'#':>2}  {'actor_lr':>8}  {'critic_lr':>9}  {'alpha_lr':>8}  "
             f"{'γ':>6}  {'τ':>8}  {'tep':>5}  "
             f"{'α₀':>5}  {'batch':>5}  {'arch':>4}  {'clip':>5}"
         )
+        if args.method == "edge":
+            hdr += f"  {'decay':>6}  {'tau':>6}  {'fxprb':>5}  {'pstart':>7}"
         print(hdr)
-        print("-" * 75)
+        print("-" * len(hdr))
         for i in range(10):
             t = _study.ask()
-            p = suggest_params(t)
+            p = suggest_params(t, method=args.method)
             clip_s = "None" if p.max_grad_norm is None else f"{p.max_grad_norm:.1f}"
-            print(
+            line = (
                 f"{i:>2}  {p.actor_lr:>8.2e}  {p.critic_lr:>9.2e}  {p.alpha_lr:>8.2e}  "
                 f"{p.gamma:>6.4f}  {p.tau:>8.2e}  "
                 f"{p.target_entropy_per_dim:>5.2f}  {p.alpha_init:>5.2f}  "
                 f"{p.batch_size:>5}  {p.arch_width:>4}  {clip_s:>5}"
             )
+            if args.method == "edge":
+                line += (
+                    f"  {p.exploration_decay_frac:>6.3f}  "
+                    f"{p.exploration_tau:>6.3f}  "
+                    f"{p.fixed_exploration_prob:>5.2f}  "
+                    f"{p.policy_update_start:>7d}"
+                )
+            print(line)
         print(
-            f"\nPhase 1: {args.trials} trials × {PHASE1_SEEDS} seeds "
-            f"× {PHASE1_TIMESTEPS:,} steps"
+            f"\nBudget: {args.trials} trials × {args.search_seeds} seeds "
+            f"× {args.search_timesteps:,} steps"
         )
-        print(
-            f"Phase 2: top-{args.top_k} × {PHASE2_SEEDS} seeds "
-            f"× {PHASE2_TIMESTEPS:,} steps"
-        )
-        print(f"Study DB: {DB_PATH}")
+        print(f"Eval window (trailing): {args.search_eval_window:,} steps")
+        print(f"Study DB: {_db_path(args.env, args.method)}")
         return
 
     # ── Results ───────────────────────────────────────────────────────────
     if args.results:
-        print_results()
+        print_results(args.env, method=args.method)
         return
 
-    # ── Phase 2 ───────────────────────────────────────────────────────────
+    # ── Phase 2 (legacy confirmation) ─────────────────────────────────────
     if args.phase2:
         gpu_ids = _get_gpu_ids(args.gpus)
-        run_phase2(top_k=args.top_k, gpu_ids=gpu_ids, use_wandb=use_wandb)
+        run_phase2(
+            top_k=args.top_k, gpu_ids=gpu_ids, env_name=args.env, method=args.method
+        )
         return
 
-    # ── Phase 1 master ────────────────────────────────────────────────────
+    # ── Single-phase master ───────────────────────────────────────────────
     gpu_ids = _get_gpu_ids(args.gpus)
-    print(f"Candidate GPUs: {gpu_ids}")
+    # Stagger orchestrators so concurrent workers don't draw identical TPE
+    # startup samples from the shared seed=42 RandomSampler. A 30s/gpu_id
+    # offset is enough for the first study.ask() to serialize via storage.
+    if gpu_ids:
+        stagger_s = min(gpu_ids[0], 4) * 30
+        if stagger_s > 0:
+            print(f"[stagger] sleeping {stagger_s}s to avoid TPE startup collision")
+            time.sleep(stagger_s)
+    print(
+        f"Candidate GPUs: {gpu_ids}  env={args.env}  method={args.method}  "
+        f"budget={args.trials} × {args.search_seeds} seeds × "
+        f"{args.search_timesteps:,} steps"
+    )
     run_master(
         gpu_ids=gpu_ids,
         n_trials=args.trials,
-        n_timesteps=PHASE1_TIMESTEPS,
-        n_seeds=PHASE1_SEEDS,
+        n_timesteps=args.search_timesteps,
+        n_seeds=args.search_seeds,
         poll_interval=args.poll,
-        use_wandb=use_wandb,
+        env_name=args.env,
+        method=args.method,
+        eval_window=args.search_eval_window,
+        enable_prune=not args.no_prune,
+        prune_warmup_steps=args.prune_warmup_steps,
+        prune_interval_steps=args.prune_interval_steps,
     )
 
 
