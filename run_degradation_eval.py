@@ -23,8 +23,8 @@ def main() -> int:
     parser.add_argument("--method", required=True)
     parser.add_argument("--gpu", type=int, required=True)
     parser.add_argument("--sigma", type=float, required=True)
-    parser.add_argument("--n-timesteps", type=int, default=2_000_000)
-    parser.add_argument("--n-seeds", type=int, default=100)
+    parser.add_argument("--n-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--n-seeds", type=int, default=50)
     parser.add_argument("--degradation-seed", type=int, default=0,
                         help="Seed for expert degradation noise (single draw)")
     parser.add_argument("--n-chunks", type=int, default=1,
@@ -57,13 +57,9 @@ def main() -> int:
     from envs import make_env_by_name  # type: ignore
     from target_gym.experts.degradation import degrade_expert
 
-    # Best hparams
-    study_name = (
-        f"sac_hp_search_{args.env.lower()}" if args.method == "sac"
-        else f"{args.method}_hp_search_{args.env.lower()}"
-    )
+    # Best hparams. All methods now use per-method subdirs.
+    study_name = f"{args.method}_hp_search_{args.env.lower()}"
     candidates = [
-        ROOT / "hp_results" / args.env.lower() / "optuna.db",
         ROOT / "hp_results" / args.env.lower() / args.method / "optuna.db",
     ]
     study = None

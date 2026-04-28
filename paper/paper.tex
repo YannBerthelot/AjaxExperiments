@@ -24,7 +24,7 @@
 % PAPER METADATA
 % ============================================================
 
-\title{Expert-Decay-Guided Exploration:\\
+\title{Expert-Driven Guided Exploration:\\
 Going Beyond Expert Performance}
 
 \author{%
@@ -45,17 +45,22 @@ Many continuous-control settings come equipped with a queryable expert
 policy: a hand-engineered controller, a motion planner, a pattern
 generator, or a behaviorally-cloned demonstrator. We study whether such
 an expert can be used to train an RL policy that exceeds its own
-performance, rather than merely match it. We identify a \emph{critic blind spot} as the
-mechanistic failure of deterministic expert-selection schemes such as
-IBRL: when the expert is always selected at states where it marginally
-dominates in Q-value, the critic never observes the policy's own action
-at those states and its estimate of $Q(s, \pi_\theta(s))$ stays
-miscalibrated, which in turn corrupts the actor update that reads from
-it. We propose \textbf{Expert-Decay-Guided Exploration (EDGE)}, a minimal
-modification to any off-policy RL algorithm that mixes expert and policy
-actions with a stochastic $\varepsilon$-greedy gate under a decaying
-influence schedule, so every visited state contributes on-policy buffer
-coverage with probability $1-p_t$. EDGE retains the buffer-coverage
+performance, rather than merely match it. We identify a \emph{critic
+blind spot} as the mechanistic failure of deterministic expert-selection
+schemes such as IBRL: when the expert is always selected at states
+where it marginally dominates in Q-value, the critic never observes the
+policy's own action at those states and its estimate of $Q(s,
+\pi_\theta(s))$ stays miscalibrated, which in turn corrupts the actor
+update that reads from it. We propose \textbf{Expert-Driven Guided
+Exploration (EDGE)}, a minimal modification to any off-policy RL
+algorithm that selects between expert and policy with a \emph{quality-aware}
+stochastic gate driven by a lower-confidence-bound (LCB) comparison of
+critic Q-values: the expert is preferred only when its LCB exceeds the
+policy's, so as the critic grows confident on policy actions the gate
+naturally hands control back to the learner. EDGE additionally feeds the
+expert's internal controller state and a running observation
+normalization into the actor and critic, so the policy can condition on
+the same information the expert uses. EDGE retains the buffer-coverage
 benefit of expert guidance early in training while leaving the policy
 free to surpass the expert asymptotically. We evaluate on five tasks
 spanning setpoint tracking with PID experts (Plane3DCircle,
@@ -93,9 +98,15 @@ selection: by storing expert actions at every state where the expert's
 Q-value marginally dominates, such schemes starve the critic of
 observations of $Q(s, \pi_\theta(s))$ at those states, leaving the
 actor update miscalibrated. We propose \textbf{EDGE}, a minimal
-$\varepsilon$-greedy expert mixing method under a decay schedule that
-guarantees every visited state appears in the buffer under the current
-policy with probability $1-p_t$.
+\emph{quality-aware} expert mixing method that gates between expert
+and policy by comparing lower confidence bounds (LCB) of their
+Q-values, and complements the gate with a running observation
+normalization and an expert-state augmentation that exposes the
+expert's internal controller state to the actor and critic. The LCB
+gate guarantees that every visited state appears in the buffer under
+the current policy with positive probability $1 - \sigma\!\big((\text{LCB}_e -
+\text{LCB}_p)/\tau\big)$, and that probability tends to $1$ as the
+critic grows confident on policy actions.
 (ii) We evaluate EDGE across five tasks spanning two families
 (Plane3DCircle, NuclearReactor, FourTank with PID experts; CheetahRun,
 BarkourJoystick with CPG experts), at 100 seeds per final configuration,
@@ -133,36 +144,48 @@ $J_{\text{exp}}$ and $J_{\text{RL}}$ on every task where either baseline
 leaves measurable headroom.
 
 \paragraph{Expert-mixed behavior policy.}
-EDGE acts under an expert-mixed behavior policy: at each step, the executed
-action is sampled from
+EDGE acts under an expert-mixed behavior policy with a
+\emph{quality-aware} gate: at each step, the gate probability is set
+from a lower-confidence-bound (LCB) comparison of the critic's value at
+the expert and policy actions, and the executed action is sampled from
 \begin{equation}
-    \beta_t(a\mid s) \;=\; p_t\,\delta_{\pi^*(s)}(a)\;+\;(1-p_t)\,\pi_\theta(a\mid s),
+    \beta_t(a\mid s) \;=\; p_t(s)\,\delta_{\pi^*(s)}(a)
+    \;+\;(1-p_t(s))\,\pi_\theta(a\mid s),
+    \quad
+    p_t(s) \;=\; \sigma\!\Big(\tfrac{\mathrm{LCB}_t(s,\pi^*(s)) -
+                              \mathrm{LCB}_t(s,\pi_\theta(s))}{\tau}\Big),
     \label{eq:behavior}
 \end{equation}
-where $\pi_\theta$ is the current learner and $p_t \in [0,1]$ is a
-non-increasing mixing schedule with $p_0 \leq \varepsilon$ and
-$p_t \to 0$. The replay buffer stores $(s, a, r, s')$ tuples with $a \sim
-\beta_t$, and is consumed by any off-policy RL algorithm that tolerates
-arbitrary full-support behavior policies (e.g.\ SAC). The expert-selection
-event at each step is independent of the state, so the Bernoulli gate and
-the state distribution decouple in all subsequent analyses.
+where $\mathrm{LCB}_t(s,a) = Q^{\min}_\phi(s,a) - \beta\,(Q^{\max}_\phi(s,a)
+- Q^{\min}_\phi(s,a))$ is the lower confidence bound across the critic
+ensemble, $\tau$ is a temperature, and $\sigma$ is the logistic. The
+replay buffer stores $(s, a, r, s')$ tuples with $a \sim \beta_t$, and
+is consumed by any off-policy RL algorithm that tolerates arbitrary
+full-support behavior policies (e.g.\ SAC). Crucially, $0 < p_t(s) < 1$
+at every state with non-degenerate critic disagreement, so the gate
+preserves full support over both arms.
 
 \begin{remark}[Asymptotic consistency]
 \label{rem:asymptotic}
-If the base off-policy algorithm $A$ converges to a behavior-policy
-independent stationary point $\pi^{A}_\infty$ under any full-support
-behavior policy, and $p_t \to 0$, then EDGE inherits that limit: from the
-first step with $p_t = 0$ onwards EDGE is operationally identical to $A$
-run on its own, and modifying a finite prefix of the replay stream does
-not alter the fixed point under standard stochastic-approximation
-assumptions. We do not claim a convergence rate.
+As the critic ensemble grows confident on policy actions, $Q^{\max}_\phi
+- Q^{\min}_\phi \to 0$ at $a = \pi_\theta(s)$, and the LCB gap on the
+right-hand side of \eqref{eq:behavior} concentrates on $Q(s,\pi^*(s)) -
+Q(s,\pi_\theta(s))$. At any state where $\pi_\theta$ has overtaken the
+expert in Q-value, $p_t(s) \to 0$, so EDGE's behavior policy converges
+pointwise to the learner. If the base off-policy algorithm $A$ converges
+to a behavior-policy independent stationary point under any full-support
+behavior policy, EDGE therefore inherits that limit: modifying a finite
+prefix of the replay stream does not alter the fixed point under
+standard stochastic-approximation assumptions. We do not claim a
+convergence rate.
 \end{remark}
 
 We state this as a remark rather than a theorem because its content is a
-sanity check on the decay schedule (the expert leaves no footprint on the
-asymptotic fixed point) rather than an independent result. A rate-style
-statement tying the decay horizon to critic calibration speed is an open
-question we return to in Section~\ref{sec:conclusion}.
+sanity check on the gate (the expert leaves no footprint on the
+asymptotic fixed point at states where the policy has overtaken it)
+rather than an independent result. A rate-style statement tying the
+LCB temperature to critic calibration speed is an open question we
+return to in Section~\ref{sec:conclusion}.
 
 % ============================================================
 \section{Related Work}
@@ -227,7 +250,7 @@ handoff instead of a per-step stochastic gate. Residual RL combines
 expert and policy additively rather than by selection.
 
 % ============================================================
-\section{Expert-Decay-Guided Exploration (EDGE)}
+\section{Expert-Driven Guided Exploration (EDGE)}
 \label{sec:method}
 % ============================================================
 
@@ -274,58 +297,74 @@ target updates $Q_\phi(s, \pi_\theta(s))$ at $s \in \mathcal{M}_t$. The
 positive counterpart follows immediately from the Bernoulli-gate
 decoupling of \eqref{eq:behavior}.
 
-\begin{lemma}[Critic coverage under $\varepsilon$-mixing]
+\begin{lemma}[Critic coverage under LCB-gated mixing]
 \label{lem:coverage}
-Let $\beta_t$ be the expert-mixed behavior policy \eqref{eq:behavior}, and
-let $\mu_t$ denote the induced state visitation distribution at step $t$.
-Then for every $s$ with $\mu_t(s) > 0$, the probability that the
-transition stored at $s$ has action drawn from $\pi_\theta$, and
-therefore provides a Bellman target anchoring $Q_\phi(s,
-\pi_\theta(s))$, is exactly $1 - p_t$. In particular, as long as $p_t <
-1$, every visited state accumulates policy-action critic anchors at
-expected rate $(1-p_t)\,\mu_t(s)$, so no persistent blind set analogous
-to $\mathcal{M}_t$ can form under $\beta_t$.
+Let $\beta_t$ be the expert-mixed behavior policy \eqref{eq:behavior}
+with state-dependent LCB gate probability $p_t(s) = \sigma\big((\mathrm{LCB}_t(s,
+\pi^*(s)) - \mathrm{LCB}_t(s, \pi_\theta(s)))/\tau\big)$, and let $\mu_t$
+denote the induced state visitation distribution at step $t$.
+Then for every $s$ with $\mu_t(s) > 0$ and finite LCB gap, the
+probability that the transition stored at $s$ has action drawn from
+$\pi_\theta$, and therefore provides a Bellman target anchoring
+$Q_\phi(s, \pi_\theta(s))$, is exactly $1 - p_t(s) \in (0, 1)$. In
+particular, every visited state accumulates policy-action critic
+anchors at expected rate $(1 - p_t(s))\,\mu_t(s)$, so no persistent
+blind set analogous to $\mathcal{M}_t$ can form under $\beta_t$.
 \end{lemma}
 
-The proof is a one-line Bernoulli argument: the expert-selection event
-at each step is independent of the state by construction of $\beta_t$.
-EDGE therefore avoids the blind spot of
-Proposition~\ref{prop:blindspot} by design. We revisit the same effect
-from a buffer-diversity perspective in Section~\ref{sec:discussion}.
+The proof is a one-line argument: conditional on the state, the gate is
+a Bernoulli draw with parameter $p_t(s) \in (0, 1)$, so the policy arm
+has positive mass everywhere. EDGE therefore avoids the blind spot of
+Proposition~\ref{prop:blindspot} by design, and does so adaptively: the
+gate places \emph{more} policy-action anchors precisely at states where
+the critic is uncertain (large LCB gap in the policy's favor would
+shrink $p_t$, while at states where the expert is clearly better the
+gate falls back on the expert and the buffer is enriched with
+high-value transitions). We revisit the same effect from a
+buffer-diversity perspective in Section~\ref{sec:discussion}.
 
 \subsection{Algorithm}
 
-EDGE is a minimal modification to any off-policy RL algorithm. Relative
-to DAgger, the only algorithmic change is that the replay tuple records
-the executed action together with its realized reward and next state,
-rather than the expert's label under the executed state: this single
-change turns the collected data from a behavior-cloning dataset into a
-valid off-policy RL dataset, and is what lets the learner eventually
-exceed the expert. At each environment step, a Bernoulli gate determines
-whether the expert or the policy acts:
+EDGE is a minimal modification to any off-policy actor-critic
+algorithm. Three pieces compose: (a) a quality-aware LCB gate that
+selects between expert and policy at every step, (b) an
+expert-state augmentation that exposes the expert's internal
+controller state (e.g.\ PID integrator state, CPG phase) to the actor
+and critic, and (c) a running observation normalization shared between
+behavior and learning. As in DAgger \citep{ross2011dagger}, the replay
+tuple records the executed action with its realized reward and next
+state (not the expert's label), which is what lets the learner
+eventually exceed the expert.
 
 \begin{algorithm}[H]
-\caption{Expert-Decay-Guided Exploration (EDGE)}
-\label{alg:ege}
+\caption{Expert-Driven Guided Exploration (EDGE)}
+\label{alg:edge}
 \begin{algorithmic}[1]
-\STATE \textbf{Hyperparameters:} $\varepsilon \in (0,1)$, $T_{\text{decay}}$
+\STATE \textbf{Hyperparameters:} LCB confidence $\beta \geq 0$, gate temperature $\tau > 0$
 \STATE Initialize base off-policy algorithm (policy $\pi_\theta$, critic
-       $Q_\phi$, replay buffer $\mathcal{B}$)
+       ensemble $\{Q_{\phi_k}\}_{k=1}^K$, replay buffer $\mathcal{B}$)
+\STATE Initialize observation normalizer $\mathcal{N}$ (running mean / std)
 \FOR{step $t = 1, \ldots, T$}
-    \STATE Observe state $s_t$
-    \STATE Compute gate probability:
-    \[
-        p_t = \varepsilon \cdot \max\!\left(1 - \frac{t}{T_{\text{decay}}}, 0\right)
-    \]
-    \IF{$\text{Bernoulli}(p_t) = 1$}
-        \STATE $a_t \leftarrow \pi^*(s_t)$ \hfill (expert action)
+    \STATE Observe environment state $s_t$ and expert internal state $z_t$
+    \STATE $\tilde s_t \leftarrow \mathcal{N}([s_t,\,z_t])$ \hfill
+           (normalized, expert-state-augmented observation)
+    \STATE Compute LCB scores at expert and policy actions:
+    \begin{align*}
+        \mathrm{LCB}_t(\tilde s_t, a) &= \min_k Q_{\phi_k}(\tilde s_t, a)
+            - \beta\,(\max_k Q_{\phi_k}(\tilde s_t, a) - \min_k Q_{\phi_k}(\tilde s_t, a)) \\
+        p_t(\tilde s_t) &= \sigma\!\Big((\mathrm{LCB}_t(\tilde s_t, \pi^*(s_t, z_t))
+                                  - \mathrm{LCB}_t(\tilde s_t, \pi_\theta(\tilde s_t)))/\tau\Big)
+    \end{align*}
+    \IF{$\text{Bernoulli}(p_t(\tilde s_t)) = 1$}
+        \STATE $a_t \leftarrow \pi^*(s_t, z_t)$ \hfill (expert action; updates $z_{t+1}$)
     \ELSE
-        \STATE $a_t \leftarrow \pi_\theta(s_t)$ \hfill (policy action)
+        \STATE $a_t \leftarrow \pi_\theta(\tilde s_t)$ \hfill (policy action)
     \ENDIF
-    \STATE Execute $a_t$, observe $r_t$, $s_{t+1}$
-    \STATE Store $(s_t, a_t, r_t, s_{t+1})$ in $\mathcal{B}$ \hfill
-           \textit{(executed action, not labeled)}
-    \STATE Update $\pi_\theta$, $Q_\phi$ via the base off-policy algorithm
+    \STATE Execute $a_t$, observe $r_t$, $s_{t+1}$, $z_{t+1}$
+    \STATE Update $\mathcal{N}$ with $[s_{t+1}, z_{t+1}]$
+    \STATE Store $(\tilde s_t, a_t, r_t, \tilde s_{t+1})$ in $\mathcal{B}$ \hfill
+           \textit{(executed action, expert-state augmented)}
+    \STATE Update $\pi_\theta$, $\{Q_{\phi_k}\}$ via the base off-policy algorithm
 \ENDFOR
 \end{algorithmic}
 \end{algorithm}
@@ -334,25 +373,30 @@ whether the expert or the policy acts:
 validated by an ablation (Sections~\ref{sec:ablation} and
 \ref{sec:exploration}): \textit{(i) use an expert at all}, contrasted
 with SAC and with a random-action source at matched rate; \textit{(ii)
-stochastic gating}, a state-independent Bernoulli gate rather than an
-argmax, contrasted with IBRL-style argmax at matched expert rate to
-test Proposition~\ref{prop:blindspot}; \textit{(iii) decaying gate
-probability}, contrasted with a constant gate; \textit{(iv) store the
-executed action} (expert or policy, whichever was taken) with its
-realized reward and next state, as opposed to DAgger-style storage of
-the expert's label regardless of what was executed, or storage of the
-learner's action regardless of what was executed, either of which
-would break the off-policy validity of the collected data; \textit{(v)
-no bootstrap proposal}, i.e.\ the expert enriches the buffer but is
-not used in Bellman target computation, contrasted with IBRL's full
-bootstrap variant.
+quality-aware LCB gating}, contrasted with IBRL-style deterministic
+argmax at matched expert rate to test
+Proposition~\ref{prop:blindspot}; \textit{(iii) expert-state
+augmentation}, contrasted with raw-state input where the policy has
+to rediscover what the stateful expert already tracks; \textit{(iv)
+running observation normalization}, contrasted with raw observations,
+since the LCB scale is meaningful only when critic inputs share scale;
+\textit{(v) store the executed action} (expert or policy, whichever
+was taken) with its realized reward and next state, as opposed to
+DAgger-style storage of the expert's label or storage of the learner's
+proposal regardless of what was executed, either of which would break
+the off-policy validity of the collected data. We additionally ablate
+\textit{(vi) the IBRL bootstrap proposal} as a separable ingredient,
+asking whether targeting $\max(Q(s', \pi_\theta), Q(s', \pi^*))$
+improves on EDGE's vanilla Bellman target.
 
-EDGE adds two hyperparameters on top of the base algorithm: mixing
-probability $\varepsilon$ (default $0.5$) and decay horizon
-$T_{\text{decay}}$ (default $0.15\,T_{\text{total}}$). Both defaults
-are swept in Section~\ref{sec:ablation}. When instantiated with SAC as
-the base algorithm, as in all our experiments, we refer to the method
-as EDGE-SAC.
+EDGE adds two hyperparameters on top of the base algorithm: LCB
+confidence $\beta$ (controls how aggressively critic disagreement
+penalizes an arm) and gate temperature $\tau$ (controls the
+sharpness of the gate around an LCB tie). Both defaults are tuned per
+task by HPO (Appendix~\ref{app:hpo}) and reported in
+Section~\ref{sec:ablation}. When instantiated with SAC as the base
+algorithm, as in all our experiments, we refer to the method as
+EDGE-SAC.
 
 % ============================================================
 \section{Experiments}
@@ -467,12 +511,40 @@ $\alpha = 0.05$.
 
 \subsection{Main Results}
 
-Table~\ref{tab:main_perenv} reports normalized return $\tilde{J}$ across
-the five benchmark tasks. The comparison targets the practitioner
-criterion stated in Section~\ref{sec:problem}: on every task where
-either the expert or the vanilla RL baseline leaves measurable
-headroom, EDGE is required to exceed both simultaneously. [Results
-pending.]
+We report results along three axes that practitioners actually trade
+off (Section~\ref{sec:problem}): asymptotic performance, sample
+efficiency, and robustness to expert sub-optimality. Per-env results
+across all five tasks are aggregated using rliable-style stratified
+bootstrap (Agarwal et al., 2021): for each method we compute the IQM
+across (env, seed) pairs after expert-normalization, and the
+probability-of-improvement against IBRL, the strongest competing
+expert-leveraging baseline. Per-env breakdowns are deferred to
+Appendix~\ref{app:perenv} so the main text can focus on the aggregate
+story.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{figs/aggregated_rliable.pdf}
+\caption{Aggregated results across the five benchmark tasks. \emph{Top
+row}: per-method IQM (vertical tick) with the inter-quartile range of
+the stratified bootstrap shown as a horizontal bar (Q1 to Q3 of the
+bootstrap distribution). Three panels: asymptotic performance
+(expert-normalized return), sample efficiency (normalized steps to
+reach expert parity, i.e.\ first permanent crossing of zero
+expert-bias; higher is faster), and robustness to
+expert degradation (expert-normalized AUC over the noisy-expert sweep).
+\emph{Bottom row}: matched probability-of-improvement against IBRL,
+same horizontal-bar convention; the dashed line at $0.5$ marks parity.
+EDGE is required to clear the $0.5$ line on all three axes
+simultaneously to support the central claim. [Results pending; figure
+regenerates from \texttt{plot\_sweep.py --paper}.]}
+\label{fig:aggregated}
+\end{figure}
+
+Table~\ref{tab:main_perenv} reports per-env asymptotic
+expert-normalized return $\tilde{J}$ as a per-env breakdown of
+Figure~\ref{fig:aggregated}'s leftmost panel. The aggregate IQM in the
+figure summarizes this table without privileging any single task.
 
 \begin{table}[h]
 \centering
@@ -492,11 +564,12 @@ Residual SAC             & tbd  & tbd  & tbd  & tbd  & tbd  \\
 \textbf{EDGE (ours)}      & tbd  & tbd  & tbd  & tbd  & tbd  \\
 \bottomrule
 \end{tabular}
-\caption{Main results across the benchmark. Values are normalized return
+\caption{Per-env asymptotic results. Values are normalized return
 $\tilde{J} = (J - J_{\text{exp}}) / (J^* - J_{\text{exp}})$: 0 means matching
 the expert, 1 means reaching the empirical upper bound, $<0$ means
 underperforming the expert. Each cell is the IQM of per-seed final-window
-returns over 100 seeds.}
+returns over 100 seeds. Per-env training curves and degradation curves
+are in Appendix~\ref{app:perenv}.}
 \label{tab:main_perenv}
 \end{table}
 
@@ -531,20 +604,17 @@ seeds that cross; final $\Delta$ is IQM of mean advantage over the last
 \label{tab:main_delta}
 \end{table}
 
-Figure~\ref{fig:curves} shows learning curves for SAC, IBRL, and EDGE on
-the primary task, with IQM across 100 seeds and bootstrap 95\% CI
-bands. Relative rankings and effect sizes are reported in
-Tables~\ref{tab:main_perenv} and \ref{tab:main_delta}. [Figure and
-numerical entries pending.]
+Figure~\ref{fig:curves_main} shows learning curves on the primary
+task, Plane3DCircle. Per-env curves on the four other tasks are in
+Appendix~\ref{app:perenv} (Figure~\ref{fig:curves_appendix}).
 
 \begin{figure}[h]
 \centering
-\fbox{\parbox[c][5cm][c]{0.85\linewidth}{\centering\textit{Placeholder:
-learning curves (return vs.\ environment step) for SAC, IBRL, JSRL,
-Residual SAC, EDGE on Plane3DCircle, 100 seeds, IQM with bootstrap
-95\% CI. Horizontal line marks $J_{\text{exp}}$.}}}
-\caption{Learning curves on the primary task. [Pending.]}
-\label{fig:curves}
+\includegraphics[width=0.85\linewidth]{figs/curves_plane3dcircle_Eval_episodic_mean_reward.pdf}
+\caption{Learning curves on Plane3DCircle. IQM across 100 seeds with
+bootstrap 95\% CI band. Horizontal dashed line marks $J_{\text{exp}}$.
+[Numerical entries pending.]}
+\label{fig:curves_main}
 \end{figure}
 
 \subsection{Ablation Study}
@@ -875,6 +945,70 @@ K.~Zakka et al.
 % ============================================================
 \appendix
 
+\section{Per-Environment Results}
+\label{app:perenv}
+% ============================================================
+
+This appendix reports per-environment training curves, expert-bias
+trajectories, and degradation curves underlying the aggregated
+Figure~\ref{fig:aggregated} and Table~\ref{tab:main_perenv}. Aggregation
+choices in the main text (expert-normalization, IQM across envs, stratified
+bootstrap) are deliberate, but the per-env curves here are the raw evidence
+behind them, so reviewers can verify nothing is hidden by aggregation.
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.48\linewidth]{figs/curves_plane3dcircle_Eval_episodic_mean_reward.pdf}\hfill
+\includegraphics[width=0.48\linewidth]{figs/curves_fourtank_Eval_episodic_mean_reward.pdf}\\
+\includegraphics[width=0.48\linewidth]{figs/curves_reactor_Eval_episodic_mean_reward.pdf}\hfill
+\includegraphics[width=0.48\linewidth]{figs/curves_cheetahrun_Eval_episodic_mean_reward.pdf}\\
+\includegraphics[width=0.48\linewidth]{figs/curves_barkourjoystick_Eval_episodic_mean_reward.pdf}
+\caption{Per-environment learning curves. IQM across 100 seeds with
+bootstrap 95\% CI band. Horizontal dashed line marks $J_{\text{exp}}$.
+[Pending; figures regenerate from \texttt{plot\_sweep.py --paper}.]}
+\label{fig:curves_appendix}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.48\linewidth]{figs/curves_plane3dcircle_Eval_expert_bias.pdf}\hfill
+\includegraphics[width=0.48\linewidth]{figs/curves_fourtank_Eval_expert_bias.pdf}\\
+\includegraphics[width=0.48\linewidth]{figs/curves_reactor_Eval_expert_bias.pdf}\hfill
+\includegraphics[width=0.48\linewidth]{figs/curves_cheetahrun_Eval_expert_bias.pdf}\\
+\includegraphics[width=0.48\linewidth]{figs/curves_barkourjoystick_Eval_expert_bias.pdf}
+\caption{Per-environment expert bias $\Delta = J - J_{\text{exp}}$. The
+horizontal axis at zero marks expert parity. [Pending.]}
+\label{fig:bias_appendix}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=0.48\linewidth]{figs/degradation_plane3dcircle.pdf}\hfill
+\includegraphics[width=0.48\linewidth]{figs/degradation_fourtank.pdf}\\
+\includegraphics[width=0.48\linewidth]{figs/degradation_reactor.pdf}\hfill
+\includegraphics[width=0.48\linewidth]{figs/degradation_cheetahrun.pdf}\\
+\includegraphics[width=0.48\linewidth]{figs/degradation_barkourjoystick.pdf}
+\caption{Per-environment degradation: final eval reward as a function of
+expert-action noise $\sigma$. Lower-bound at SAC reflects the expert-free
+floor. [Pending.]}
+\label{fig:degradation_appendix}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\includegraphics[width=\linewidth]{figs/sample_efficiency_sweep.pdf}
+\caption{Sample-efficiency sweep at three normalized bias thresholds.
+Each panel reports the IQM (vertical tick) with bootstrap inter-quartile
+range (horizontal bar) of the per-seed score $1 - t / T$, where $t$ is
+the first env-step at which the policy permanently exceeds
+$\alpha\,J_{\mathrm{exp}}$ in expert-bias and $T$ is the training
+budget. $\alpha = 0$ (parity) is the headline metric in
+Figure~\ref{fig:aggregated}; $\alpha = 0.25$ and $\alpha = 0.5$ test
+whether EDGE's sample-efficiency lead survives raising the bar past
+parity. [Pending.]}
+\label{fig:sample_efficiency_sweep}
+\end{figure}
+
 \section{Benchmark Tasks}
 \label{app:tasks}
 % ============================================================
@@ -969,6 +1103,34 @@ training runs per configuration at the best-found hyperparameters.
 The main body treats each task's expert as a black-box oracle. This appendix
 describes how each expert is actually tuned, why we chose these protocols,
 and what tuning would have been unfair.
+
+\paragraph{Scope of the expert claims.}
+We are not specialists in PID auto-tuning, gain-scheduling, or central
+pattern generator design, and the controllers we ship were tuned with
+modest budgets using off-the-shelf protocols described below. They are
+included as \emph{representative} hand-engineered controllers of the
+kind a practitioner might already have running on a plant, not as
+strong-baseline references for those subfields. A domain expert with a
+larger tuning budget would likely produce a controller above ours on
+every task. The argument of the paper is therefore not "EDGE beats the
+best possible PID/CPG"; it is "EDGE turns a plausible
+hand-engineered controller, with the same access the practitioner has
+to it, into an RL policy that exceeds the controller it was given." The
+ablations in Section~\ref{sec:sensitivity} test the same construction
+against deliberately weakened experts so the reader can interpolate
+between the experts we ship and stronger ones a domain expert could
+plausibly produce.
+
+\paragraph{BarkourJoystick CPG limitation.}
+The CPG used for BarkourJoystick is purely time-driven (open-loop sine
+on each actuator with tuned frequency, amplitude, and phase) and
+therefore does not command-track the joystick. Its $J_{\mathrm{exp}}$
+on the joystick task averages over random commands at which the
+fixed-gait CPG happens to roughly match the desired velocity. A
+command-conditioned CPG is an open design choice we did not take on;
+BarkourJoystick is included as an appendix robustness probe, where
+EDGE's value comes mainly from buffer coverage of expert-feasible
+gaits, not from the expert solving the joystick problem.
 
 \subsection{PID Experts, Relay Autotuning with Operating-Point Sweep}
 

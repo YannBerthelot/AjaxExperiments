@@ -1,13 +1,16 @@
-"""EDGE design ablations.
+"""EDGE-QA design ablations (paper §5.3).
 
-Reads the best EDGE hyperparameters from the Optuna HPO for the given env,
-overrides one or more SAC kwargs per the ``--variant`` choice, trains at
-``--n-timesteps`` steps × ``--n-seeds`` seeds, and writes a JSON result
-to ``ablation_results/<env>__<variant>.json``.
+Reads the best ``sac_quality_aware`` (EDGE-QA / LCB) hyperparameters from
+the Optuna HPO for the given env, overrides one or more SAC kwargs per
+the ``--variant`` choice, retrains at ``--n-timesteps`` steps ×
+``--n-seeds`` seeds, and writes a JSON result to
+``ablation_results/<env>__<variant>.json``.
 
-Variants correspond to §5.3 ablations in the paper:
-    gating_argmax, mc_pretrain, decay_{0.05,0.30,0.50,1.00},
-    eps_{0.1,0.25,0.75,0.9}
+Each variant flips a single design choice of EDGE-QA so we can attribute
+the gain to (a) the LCB gate, (b) the obs+expert_state augmentation, or
+(c) running observation normalisation. The baseline gating-mechanism
+comparison vs ε-greedy is provided by the ``edge`` method's own HPO
+in run_full_study.py — no separate ablation variant is needed for it.
 """
 
 from __future__ import annotations
@@ -23,19 +26,71 @@ ABLATION_RESULTS = ROOT / "ablation_results"
 CHECKPOINT_DIR = ROOT / "checkpoints"
 
 
-# variant name -> dict of EDGE method_kwargs overrides applied on top of the
-# tuned-EDGE config from the HPO study.
+# Variant name -> dict of SAC method_kwargs overrides applied on top of
+# the tuned EDGE-QA config from the sac_quality_aware HPO study. Each
+# variant flips exactly one design knob so the ablation cleanly
+# attributes the change in score.
 ABLATION_VARIANTS: dict = {
-    "gating_argmax":   {"exploration_argmax": True},
-    "mc_pretrain":     {"use_mc_critic_pretrain": True},
-    "decay_0.05":      {"exploration_decay_frac": 0.05},
-    "decay_0.30":      {"exploration_decay_frac": 0.30},
-    "decay_0.50":      {"exploration_decay_frac": 0.50},
-    "decay_1.00":      {"exploration_decay_frac": 1.00},
-    "eps_0.1":         {"fixed_exploration_prob": 0.1},
-    "eps_0.25":        {"fixed_exploration_prob": 0.25},
-    "eps_0.75":        {"fixed_exploration_prob": 0.75},
-    "eps_0.9":         {"fixed_exploration_prob": 0.9},
+    # ──────── Gating mechanism ────────
+    # Replace the LCB gate with hard argmax over critic-mean Q. Removes
+    # the disagreement-based deferral to expert in unknown regions.
+    "gating_argmax": {
+        "exploration_lcb": False,
+        "exploration_thompson": False,
+        "exploration_argmax": True,
+    },
+    # ──────── Preprocessing ────────
+    # Drop the obs+expert_state augmentation. Tests whether the
+    # non-Markov fix (V3 critic-fit diagnostic) is the load-bearing
+    # piece on stateful-expert tasks.
+    "no_state_aug": {
+        "augment_obs_with_expert_state": False,
+    },
+    # Drop the agent-side running observation normalisation. Tests
+    # whether the always-on preprocessing is really required when
+    # state-aug is on (integrator dims std ~10^4).
+    "no_obs_norm": {
+        "normalize_obs_running": False,
+    },
+    # ──────── Critic target / bootstrap ────────
+    # Add IBRL-style max(Q_policy, Q_expert) TD target on top of the
+    # LCB gate. Decomposes IBRL's contribution from its argmax action
+    # selection — pairs with the IBRL method-level baseline.
+    "bootstrap_argmax": {
+        "ibrl_bootstrap": True,
+    },
+    # Apply the LCB gate at the value bootstrap step too (not only at
+    # action selection): TD target = Q(s', a_lcb_gated'). Tests whether
+    # consistent LCB-everywhere is strictly better than LCB-on-action-
+    # selection-only. If yes, this becomes part of edge-qa's default.
+    "bootstrap_lcb_gated": {
+        "lcb_gated_bootstrap": True,
+    },
+    # ──────── Expert quality ────────
+    # Replace the PID expert with a stateful random-action policy that
+    # mirrors the PID expert's state shape. Same dim of obs+expert_state,
+    # uninformative actions and state. Tests "the expert provides signal,
+    # not just structured noise." Marker; expert swap is plumbed via
+    # build_agent_and_train.expert_override below.
+    "random_expert": {"__expert_override": "random_scrambled"},
+    # ──────── Off-policy correctness ────────
+    # Store the policy's action in the buffer (instead of the actually-
+    # executed action). Misspecified Q learning when the gate selected
+    # the expert. Justifies the design choice of storing executed
+    # actions.
+    "store_policy_action": {
+        "store_policy_action": True,
+    },
+    # ──────── Orthogonal augmentation: tt-prefill ────────
+    # Add jsrl-tt-style training-time expert prefill on top of edge-qa
+    # (LCB gate stays on). 100k expert transitions per seed are written
+    # into the replay buffer before any learner rollout. Tests whether
+    # the buffer-prefill mechanism (which makes our jsrl-tt baseline
+    # surprisingly competitive on clean experts) is additive on top of
+    # the LCB gate, or substitutes for it.
+    "expert_prefill": {
+        "expert_buffer_n_steps": 100_000,
+    },
 }
 
 
@@ -44,8 +99,8 @@ def main() -> int:
     parser.add_argument("--env", required=True)
     parser.add_argument("--variant", required=True, choices=list(ABLATION_VARIANTS))
     parser.add_argument("--gpu", type=int, required=True)
-    parser.add_argument("--n-timesteps", type=int, default=2_000_000)
-    parser.add_argument("--n-seeds", type=int, default=100)
+    parser.add_argument("--n-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--n-seeds", type=int, default=50)
     args = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -61,11 +116,11 @@ def main() -> int:
     import optuna
     from optuna.trial import TrialState
 
-    # Ablations always start from the tuned EDGE configuration.
-    method = "edge"
-    study_name = f"edge_hp_search_{args.env.lower()}"
+    # Ablations always start from the tuned EDGE-QA (sac_quality_aware)
+    # configuration. Each variant flips one knob in method_kwargs.
+    method = "sac_quality_aware"
+    study_name = f"sac_quality_aware_hp_search_{args.env.lower()}"
     candidates = [
-        ROOT / "hp_results" / args.env.lower() / "optuna.db",
         ROOT / "hp_results" / args.env.lower() / method / "optuna.db",
     ]
     study = None
@@ -95,11 +150,27 @@ def main() -> int:
         return 4
     best = max(done, key=lambda t: t.value)
 
-    override = ABLATION_VARIANTS[args.variant]
+    override = dict(ABLATION_VARIANTS[args.variant])
     print(
         f"[ablation] {args.env}/{args.variant}: best trial={best.number} "
         f"score={best.value:.2f}  override={override}"
     )
+
+    # ``random_expert`` is special: instead of overriding a method_kwarg,
+    # it swaps the expert_policy passed to build_agent_and_train. We keep
+    # the marker key in override so the JSON record reflects the variant
+    # but pull it out before the kwargs reach SAC.
+    expert_override = None
+    if override.pop("__expert_override", None) == "random_scrambled":
+        from random_expert import RandomScrambledExpert
+        from envs import make_env_by_name
+        from sac_hyperparam_search import _load_expert_policy
+        from ajax.environments.utils import get_action_dim
+        _env, _params = make_env_by_name(args.env)
+        _template_expert = _load_expert_policy(args.env, _env)
+        _action_dim = get_action_dim(_env, _params)
+        expert_override = RandomScrambledExpert(_template_expert, _action_dim)
+        print(f"[ablation] random_expert: swapped expert with RandomScrambledExpert")
 
     seeds = list(range(args.n_seeds))
     ckpt_path = (
@@ -113,6 +184,7 @@ def main() -> int:
         n_timesteps=args.n_timesteps,
         checkpoint_path=str(ckpt_path),
         method_kwargs_override=override,
+        expert_override=expert_override,
     )
 
     ABLATION_RESULTS.mkdir(parents=True, exist_ok=True)
