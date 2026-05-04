@@ -103,7 +103,15 @@ SUPPORTED_METHODS = (
     # Paper methods (the ones we'll keep for the final HPO + comparison):
     "sac",                    # vanilla SAC baseline (no expert)
     "edge",                   # edge-eps: SAC + ε-greedy expert gating (gating-ablation baseline)
-    "sac_quality_aware",      # SAC + LCB expert gating + obs+state aug (proposed)
+    "sac_quality_aware",      # SAC + symmetric LCB expert gating + obs+state aug
+    "edge_qa_optimistic",     # variant of sac_quality_aware: HPO over signed β
+                              # (β ∈ ±[0.1, 5.0]) and wider τ ∈ [0.001, 10.0]
+                              # so the (β, τ) surface contains IBRL ((0, 0)
+                              # limit), vanilla TS (β=0), pessimistic TS
+                              # (β>0), and optimistic TS (β<0). Restricted to
+                              # FourTank in build_unit_list (HPO chose β=0.1
+                              # at the lower bound there, suggesting the
+                              # optimum is on the optimistic side).
     "jsrl_curriculum",        # JSRL with per-episode curriculum (Uchendu et al. 2023, faithful)
     # Other agents kept for legacy compatibility — not part of the paper.
     "residual", "ibrl", "pid_policy", "jsrl",
@@ -112,6 +120,18 @@ SUPPORTED_METHODS = (
 
 def _is_td3(method: str) -> bool:
     return False
+
+
+def _opt_int(v):
+    """Cast to int, passing None through cleanly (used by
+    ``_hpparams_from_dict`` so that a null entry in
+    ``trial_<n>_params.json`` doesn't blow up on ``int(None)``)."""
+    return None if v is None else int(v)
+
+
+def _opt_float(v):
+    """Float counterpart of ``_opt_int``."""
+    return None if v is None else float(v)
 
 
 def _env_slug(env_name: str) -> str:
@@ -175,6 +195,29 @@ PRUNE_N_STARTUP_TRIALS = 5        # first N trials never pruned (median seed)
 
 LOG_FREQUENCY = 10_000
 NUM_EPISODE_TEST = 25
+
+
+def _eval_schedule(env_name: str, phase: int) -> tuple[int, bool]:
+    """Per-(env, phase) (log_frequency, sweep) override.
+
+    Reactor's full-horizon eval is ~10x longer per call than other envs
+    (8640 env-steps vs ~1000), which made eval cost dominate at the
+    default LOG_FREQUENCY=10k (~12 st/s observed). Special-case it:
+
+    * phase1 (HPO search, 300k steps): only the trailing-window IQM
+      matters, so sweep=True suppresses evals before 80% of training
+      and frequency=12k yields exactly 5 evals over the last 60k window.
+    * phase2/3 (1M-step reruns): we want granular learning curves for
+      plotting, so 50k throughout (20 evals per run, 5x sparser than
+      default, ~3-5x faster than current).
+
+    Other envs keep the global defaults (LOG_FREQUENCY, sweep=False).
+    """
+    if env_name == "Reactor":
+        if phase == 1:
+            return 12_000, True
+        return 50_000, False
+    return LOG_FREQUENCY, False
 
 
 # ---------------------------------------------------------------------------
@@ -376,13 +419,23 @@ def suggest_params(trial, method: str = "sac") -> HPParams:
     epsilon_floor = None
     lcb_beta_init = None
     lcb_temperature = None
-    if method == "sac_quality_aware":
-        # Proposed method: SAC + critic ensemble + LCB gating between
+    if method in ("sac_quality_aware", "r_edge_bow", "edge_qa_optimistic"):
+        # Proposed methods: SAC + critic ensemble + LCB gating between
         # policy and (stateful) expert + obs+expert_state augmentation
         # + agent-side obs normalisation. Method-specific HPO axes:
         #   num_critics  — ensemble size (drives LCB σ signal)
         #   lcb_beta_init — disagreement penalty weight
         #   lcb_temperature — sigmoid sharpness on advantage
+        # ``r_edge_bow`` adds asymmetric pessimism (LCB on expert /
+        # UCB on policy) and the IBRL bootstrap proposal; same HPO
+        # axes as sac_quality_aware so we can compare apples-to-apples.
+        # ``edge_qa_optimistic`` extends β to ±[0.1, 5.0] (signed-log
+        # via a sign categorical) and τ to [0.001, 10.0] so the (β, τ)
+        # surface contains IBRL ((0, 0) limit), vanilla TS (β=0),
+        # pessimistic TS (β>0), and optimistic TS (β<0). Used on
+        # FourTank to test whether the lower-bound β=0.1 saturation in
+        # the standard sac_quality_aware HPO indicates an unexplored
+        # optimistic optimum.
         pre_train_n_steps = 0
         target_entropy_initial_per_dim = None
         target_entropy_ramp_frac = None
@@ -390,8 +443,18 @@ def suggest_params(trial, method: str = "sac") -> HPParams:
         num_critics = trial.suggest_categorical("num_critics", [2, 4])
         expert_buffer_n_steps_value = 0
         epsilon_floor = 0.0
-        lcb_beta_init = trial.suggest_float("lcb_beta_init", 0.1, 5.0, log=True)
-        lcb_temperature = trial.suggest_float("lcb_temperature", 0.1, 10.0, log=True)
+        if method == "edge_qa_optimistic":
+            beta_sign = trial.suggest_categorical("lcb_beta_sign", [-1.0, 1.0])
+            beta_mag = trial.suggest_float("lcb_beta_mag", 0.1, 5.0, log=True)
+            lcb_beta_init = float(beta_sign) * float(beta_mag)
+            lcb_temperature = trial.suggest_float(
+                "lcb_temperature", 0.001, 10.0, log=True
+            )
+        else:
+            lcb_beta_init = trial.suggest_float("lcb_beta_init", 0.1, 5.0, log=True)
+            lcb_temperature = trial.suggest_float(
+                "lcb_temperature", 0.1, 10.0, log=True
+            )
     residual_scale = None
     if method == "residual":
         # Johannink et al. 2019 / Silver et al. 2018: scale the policy
@@ -507,7 +570,9 @@ def read_final_metric(
 
 _ENV_EPISODE_LENGTH: Dict[str, int] = {
     "Plane3DCircle": 10_000,
+    "Plane3DFigureEight": 10_000,
     "Reactor": 8_640,
+    "GlassFurnace": 5_760,
     "FourTank": 500,
     "CheetahRun": 1_000,
     "BarkourJoystick": 1_000,
@@ -676,7 +741,7 @@ def _build_method_kwargs(method: str, expert_policy, params: HPParams,
             policy_update_start=params.policy_update_start,
             alpha_update_start=params.policy_update_start,
         )
-    if method == "sac_quality_aware":
+    if method in ("sac_quality_aware", "r_edge_bow", "edge_qa_optimistic"):
         # Minimal principled method + expert_state augmentation.
         # The diagnostic showed the critic CAN'T fit Q(s, a) on a
         # PID-expert dataset (RMSE/std ≈ 0.30) without the integrator
@@ -686,6 +751,15 @@ def _build_method_kwargs(method: str, expert_policy, params: HPParams,
         # `augment_obs_with_expert_action`: this exposes a STATE, not
         # an ACTION, so it doesn't bias the policy toward copying the
         # expert.
+        #
+        # ``r_edge_bow`` is the robust variant: same gate machinery but
+        # (1) the LCB scoring is asymmetric (LCB on expert / UCB on
+        # policy) so the gate hands control to the policy whenever the
+        # critic ensemble disagrees on a policy action, and (2) the
+        # IBRL bootstrap proposal is added to the TD target so the
+        # critic uses the expert as an optimistic anchor when the
+        # expert is reliable, and falls back to vanilla SAC otherwise.
+        is_robust = (method == "r_edge_bow")
         return dict(
             expert_policy=expert_policy,
             residual=False,
@@ -700,6 +774,11 @@ def _build_method_kwargs(method: str, expert_policy, params: HPParams,
             lcb_beta_init=params.lcb_beta_init,
             lcb_beta_decay_k=2.0,
             lcb_temperature=params.lcb_temperature,
+            # r_edge_bow gets the asymmetric LCB (UCB on policy arm)
+            # AND the IBRL bootstrap proposal; sac_quality_aware uses
+            # symmetric LCB and the standard SAC TD target.
+            lcb_asymmetric=is_robust,
+            ibrl_bootstrap=is_robust,
             epsilon_floor=0.0,         # no floor
             target_entropy_initial_per_dim=None,
             target_entropy_ramp_frac=0.5,  # unused when initial is None
@@ -804,42 +883,25 @@ def _hpparams_from_dict(
         policy_delay=(
             int(best_params["policy_delay"]) if is_td3 else None
         ),
-        pre_train_n_steps=(
-            int(best_params["pre_train_n_steps"])
-            if "pre_train_n_steps" in best_params else None
-        ),
-        num_critics=(
-            int(best_params["num_critics"])
-            if "num_critics" in best_params else None
-        ),
-        qa_temperature=(
-            float(best_params["qa_temperature"])
-            if "qa_temperature" in best_params else None
-        ),
-        expert_buffer_n_steps=(
-            int(best_params["expert_buffer_n_steps"])
-            if "expert_buffer_n_steps" in best_params else None
+        # Use ``_opt_int`` / ``_opt_float`` helpers so a None value (which
+        # happens when a hardcoded HP slot is null in trial_<n>_params.json)
+        # passes through cleanly instead of crashing on ``int(None)``.
+        pre_train_n_steps=_opt_int(best_params.get("pre_train_n_steps")),
+        num_critics=_opt_int(best_params.get("num_critics")),
+        qa_temperature=_opt_float(best_params.get("qa_temperature")),
+        expert_buffer_n_steps=_opt_int(
+            best_params.get("expert_buffer_n_steps")
         ),
         exploration_decay_frac=decay_frac,
-        exploration_tau=best_params.get("exploration_tau"),
-        fixed_exploration_prob=best_params.get("fixed_exploration_prob"),
-        policy_update_start=best_params.get("policy_update_start"),
-        lcb_beta_init=(
-            float(best_params["lcb_beta_init"])
-            if "lcb_beta_init" in best_params else None
+        exploration_tau=_opt_float(best_params.get("exploration_tau")),
+        fixed_exploration_prob=_opt_float(
+            best_params.get("fixed_exploration_prob")
         ),
-        lcb_temperature=(
-            float(best_params["lcb_temperature"])
-            if "lcb_temperature" in best_params else None
-        ),
-        residual_scale=(
-            float(best_params["residual_scale"])
-            if "residual_scale" in best_params else None
-        ),
-        jsrl_decay_frac=(
-            float(best_params["jsrl_decay_frac"])
-            if "jsrl_decay_frac" in best_params else None
-        ),
+        policy_update_start=_opt_int(best_params.get("policy_update_start")),
+        lcb_beta_init=_opt_float(best_params.get("lcb_beta_init")),
+        lcb_temperature=_opt_float(best_params.get("lcb_temperature")),
+        residual_scale=_opt_float(best_params.get("residual_scale")),
+        jsrl_decay_frac=_opt_float(best_params.get("jsrl_decay_frac")),
     )
 
 
@@ -1008,16 +1070,17 @@ def build_agent_and_train(
     if method_kwargs_override:
         method_kwargs = {**method_kwargs, **method_kwargs_override}
 
+    _log_freq, _sweep = _eval_schedule(env_name, phase=3)
     logging_config = LoggingConfig(
         project_name=_project_name(env_name, method),
         run_name=f"final_eval_{method}",
         config={"method": method, "mode": "final_eval", **best_params},
-        log_frequency=LOG_FREQUENCY,
+        log_frequency=_log_freq,
         horizon=10_000,
         folder=str(FINAL_RESULTS_TB_DIR(env_name, method)),
         use_tensorboard=True,
         use_wandb=False,
-        sweep=False,
+        sweep=_sweep,
     )
 
     agent = _construct_agent(
@@ -1114,13 +1177,15 @@ def run_worker(
                                          env_name=env_name)
 
     phase_tag = _phase_suffix(phase2, phase3)
+    _phase_num = 3 if phase3 else (2 if phase2 else 1)
+    _log_freq, _sweep = _eval_schedule(env_name, _phase_num)
     logging_config = LoggingConfig(
         project_name=_project_name(env_name, method),
         run_name=f"trial_{params.trial_number:03d}{phase_tag}",
         config={
             "debug": False,
             "method": method,
-            "log_frequency": LOG_FREQUENCY,
+            "log_frequency": _log_freq,
             "actor_lr": params.actor_lr,
             "critic_lr": params.critic_lr,
             "alpha_lr": params.alpha_lr,
@@ -1135,14 +1200,14 @@ def run_worker(
             "exploration_tau": params.exploration_tau,
             "fixed_exploration_prob": params.fixed_exploration_prob,
             "policy_update_start": params.policy_update_start,
-            "phase": 2 if phase2 else 1,
+            "phase": _phase_num,
         },
-        log_frequency=LOG_FREQUENCY,
+        log_frequency=_log_freq,
         horizon=10_000,
         folder=tb,
         use_tensorboard=True,
         use_wandb=False,
-        sweep=False,
+        sweep=_sweep,
     )
 
     agent = _construct_agent(
@@ -1922,9 +1987,15 @@ def _save_best_to_yaml(trial_number: int, env_name: str, method: str = "sac") ->
         return
 
     params = HPParams.from_json(pp)
-    import ajax as _ajax_pkg
+    # Human-readable YAML mirror of the best HPParams. Lives inside
+    # AjaxExperiments (next to the script) rather than in the sibling
+    # Ajax library directory: experiment artifacts shouldn't dirty the
+    # library's working tree, and nothing in our pipeline reads these
+    # YAMLs back (the source of truth is trial_NNN_params.json under
+    # hp_results/). The file is purely for at-a-glance inspection of
+    # best-trial settings per (env, method).
     yaml_name = "ajax_sac.yml" if method == "sac" else f"ajax_sac_{method}.yml"
-    yaml_path = Path(_ajax_pkg.__file__).parents[2] / "hyperparams" / yaml_name
+    yaml_path = Path(__file__).resolve().parent / "hyperparams" / yaml_name
 
     if yaml_path.exists():
         with open(yaml_path) as f:

@@ -40,7 +40,10 @@ def main() -> int:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
     try:
-        from sac_hyperparam_search import build_agent_and_train  # type: ignore
+        from sac_hyperparam_search import (  # type: ignore
+            build_agent_and_train,
+            _load_expert_policy,
+        )
     except ImportError:
         sys.stderr.write(
             "[degradation] sac_hyperparam_search.build_agent_and_train not found.\n"
@@ -86,11 +89,28 @@ def main() -> int:
         sys.stderr.write(f"[degradation] No COMPLETE trials\n")
         return 4
     best = max(done, key=lambda t: t.value)
-    best_params = best.params
+    # Optuna's `best.params` only contains TPE-suggested fields; HPParams
+    # entries that were *hardcoded* inside `suggest_params` (e.g.
+    # ``fixed_exploration_prob=1.0`` for jsrl-tt, ``exploration_tau=1.0``)
+    # are missing from it. The worker writes the full HPParams dict to
+    # ``trial_<n>_params.json`` at trial start, so we load that instead.
+    params_path = (
+        ROOT / "hp_results" / args.env.lower() / args.method
+        / f"trial_{best.number:03d}_params.json"
+    )
+    if params_path.exists():
+        import json as _json
+        best_params = _json.loads(params_path.read_text())
+    else:
+        # Legacy fallback (older trials without per-trial param files).
+        best_params = dict(best.params)
 
-    # Build anchor expert then degrade it
+    # Build anchor expert then degrade it. Use _load_expert_policy
+    # rather than env.expert_policy directly: Mujoco Playground envs
+    # (CheetahRun, BarkourJoystick) don't carry the expert as an attr;
+    # _load_expert_policy routes them through the CPG factory.
     env, _env_params = make_env_by_name(args.env)
-    anchor_expert = env.expert_policy
+    anchor_expert = _load_expert_policy(args.env, env)
     degraded = degrade_expert(
         anchor_expert, args.sigma, jax.random.PRNGKey(args.degradation_seed)
     )
@@ -153,6 +173,38 @@ def main() -> int:
             tb_folder, run_ids, window_steps=final_window
         )
         payload["final_metric_window_steps"] = final_window
+        # Dump per-seed final-window means + run_ids so paper figures
+        # can compute Q1/Q3 over the seed distribution at this sigma.
+        try:
+            from ajax.logging.wandb_logging import (
+                load_scalars_from_tfevents,
+            )
+            EVAL_TAG = "Eval/episodic_mean_reward"
+            per_seed = []
+            for rid in run_ids:
+                log_dir = os.path.join(tb_folder, "tensorboard", str(rid))
+                if not os.path.exists(log_dir):
+                    per_seed.append(None)
+                    continue
+                try:
+                    scalars = load_scalars_from_tfevents(log_dir)
+                except Exception:
+                    per_seed.append(None)
+                    continue
+                if EVAL_TAG not in scalars or not scalars[EVAL_TAG]:
+                    per_seed.append(None)
+                    continue
+                entries = scalars[EVAL_TAG]
+                max_step = entries[-1][0]
+                window = [v for step, v in entries
+                          if step >= max_step - final_window]
+                per_seed.append(
+                    float(sum(window) / len(window)) if window else None
+                )
+            payload["per_seed_metric"] = per_seed
+            payload["run_ids"] = [str(r) for r in run_ids]
+        except Exception as e:
+            payload["per_seed_metric_error"] = str(e)
     except Exception as e:
         payload["final_metric"] = None
         payload["final_metric_error"] = str(e)

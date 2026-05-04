@@ -59,13 +59,26 @@ def _set_pdeathsig() -> None:
 
 ENVS: List[str] = [
     # Priority order: P3D first (headline), then locomotion, then control envs.
+    # Reactor removed for now: post-env-fix, full 8640-step episodes ×
+    # CONTROL_PERIOD=10 × rk4_50 make eval dominate even with sweep=True +
+    # 12k log_freq (~12 st/s observed). Re-add once we have a real eval-cap fix.
+    # GlassFurnace gets in (same long-ish episodes but rk4_1 + no
+    # control_period, ~750x cheaper physics per env-step than Reactor).
+    # Plane3DFigureEight is parked last as a generalization add-on — same
+    # plane env as P3D Circle, weaker expert (~3% of optimum) makes for a
+    # sharp edge-qa showcase but isn't headline-critical.
     "Plane3DCircle",
     "CheetahRun",
-    "Reactor",
     "FourTank",
-    # BarkourJoystick temporarily gated for the same reason as CheetahRun
-    # (CPG expert re-tuning). Re-add once tuning completes.
-    # "BarkourJoystick",
+    "GlassFurnace",
+    "BarkourJoystick",
+    "Plane3DFigureEight",
+    # BarkourJoystick: CPG returns ~3.5 standalone (joystick-blind forward trot
+    # mismatches most random commands), BUT the gait-structured rollouts it
+    # produces are far more useful to a learning agent than random actions —
+    # the kickstart value (upright trajectories, diagonal-pair anti-phase
+    # coordination) is what matters for JSRL/IBRL/edge-qa, not the expert's
+    # standalone task reward.
 ]
 
 # METHODS list. Order matters: it drives the per-env work-unit ordering
@@ -75,7 +88,14 @@ ENVS: List[str] = [
 # it's only used for the §5.3 gating-mechanism ablation.
 METHODS: List[str] = [
     "sac",                   # vanilla SAC baseline
-    "sac_quality_aware",     # proposed: SAC + LCB expert gating + obs+state aug
+    "sac_quality_aware",     # proposed: symmetric LCB gating (edge-qa)
+    # NOTE: "edge_qa_optimistic" deprioritized 2026-05-04 to free GPU for
+    # GlassFurnace HPO. Method definition is preserved in
+    # sac_hyperparam_search.py and the env restriction below; to re-enable,
+    # uncomment the entry and delete the deprioritized placeholders at
+    # hp_results/fourtank/edge_qa_optimistic/trial_999_phase3_result.json
+    # and degradation_results/fourtank__edge_qa_optimistic__sigma{0.25,0.5,0.75}.json.
+    # "edge_qa_optimistic",  # FourTank-only variant of edge-qa: signed β + wider τ
     "ibrl",                  # baseline: SAC + argmax bootstrap on expert
     "jsrl_curriculum",       # baseline: SAC + per-episode JSRL curriculum (Uchendu 2023)
     "jsrl",                  # baseline: SAC + JSRL training-time handoff (simpler variant)
@@ -91,6 +111,7 @@ METHODS: List[str] = [
 _METHOD_DISPLAY: dict = {
     "edge": "edge-eps",
     "sac_quality_aware": "edge-qa",
+    "edge_qa_optimistic": "edge-qa-opt",
     "jsrl_curriculum": "jsrl-cur",
     "jsrl": "jsrl-tt",
 }
@@ -123,11 +144,16 @@ DEGRADATION_SEEDS = 50
 # table eval). Shown in the status table so each method's numbers land
 # against the "beat the expert" goalpost at a glance.
 EXPERT_REFERENCE: dict = {
-    "Plane3DCircle": 3784.0,
+    "Plane3DCircle": 4765.8,  # actual eval-set expert (was 3784 before retune)
+    "Plane3DFigureEight": 314.93,  # 20-seed mean (CV 0.94 — expert often fails)
     "Reactor": 21479.0,
+    "GlassFurnace": 4315.31,  # 20-seed mean (CV 0.43)
     "FourTank": 246.0,
     "CheetahRun": 291.2,  # 16-seed mean of retuned CPG (cpg_tuned_cheetahrun.json)
-    "BarkourJoystick": 6.6,  # 20-seed mean of hand-tuned trot CPG (std 4.56)
+    "BarkourJoystick": 3.5,  # joystick-blind forward-trot CPG; standalone reward
+                              # is low because trot mismatches random joystick
+                              # commands, but the gait-structured rollouts kickstart
+                              # learning. Per-seed bias from TB is the actual signal.
 }
 
 # EDGE-QA design ablations (§5.3). Variants from run_ablation_eval.ABLATION_VARIANTS;
@@ -149,8 +175,15 @@ ABLATION_VARIANTS: List[str] = [
     # Orthogonal augmentation: tt-prefill on top of edge-qa
     "expert_prefill",
 ]
-# Envs the ablation study runs on, in order of priority (FourTank first).
-ABLATION_ENVS: List[str] = ["FourTank", "CheetahRun"]
+# Envs the ablation study runs on, in order of priority (P3DCircle first).
+# Switched away from FourTank: per the SAC vs IBRL one-sided permutation test
+# (n=50, p=0.034, 4-point IQM gap, Cohen's d=0.43), FourTank's per-seed std
+# (~10) makes it borderline even for fundamentally-different methods. Ablation
+# variants of EDGE produce smaller effects than method swaps and would mostly
+# return "not significantly different" — uninformative. P3DCircle's
+# thousands-of-points spread between methods gives clean SNR for design-choice
+# ablations.
+ABLATION_ENVS: List[str] = ["Plane3DCircle", "CheetahRun"]
 ABLATION_SEEDS = 50
 
 GPUS: List[int] = [0, 1, 2]
@@ -179,6 +212,11 @@ class WorkUnit:
     method: str = field(compare=False)
     sigma: Optional[float] = field(default=None, compare=False)
     variant: Optional[str] = field(default=None, compare=False)
+    # How many times this unit has been requeued after a non-zero
+    # dispatch exit (master killed for an online fix, hardware glitch,
+    # OOM, etc.). Capped by GPUWorker so a permanently-broken config
+    # does not spin forever; reset implicitly on master restart.
+    retries: int = field(default=0, compare=False)
 
     def name(self) -> str:
         tag = f"{self.env}.{self.method}"
@@ -285,8 +323,16 @@ def _hpo_inflight_metric(env: str, method: str) -> Optional[tuple]:
 _IQM_CACHE: dict = {}
 
 
-def _read_seed_curves(tb_dir: Path) -> dict:
-    """Return {step: [v_seed1, v_seed2, ...]} for Eval/episodic_mean_reward."""
+def _read_seed_curves(tb_dir: Path,
+                      tag: str = "Eval/episodic_mean_reward") -> dict:
+    """Return {step: [v_seed1, v_seed2, ...]} for the requested scalar tag.
+
+    Skips subfolders whose event file is a tiny stub (<10 KB) — these
+    are leftovers from worker processes that crashed at JAX init and
+    never wrote real training data. Without this filter, the IQM
+    function gets confused when a trial has been retried multiple
+    times in the same TB folder.
+    """
     base = tb_dir / "tensorboard"
     if not base.is_dir():
         return {}
@@ -298,6 +344,64 @@ def _read_seed_curves(tb_dir: Path) -> dict:
     for sd in base.iterdir():
         if not sd.is_dir():
             continue
+        sized_files = []
+        for f in sd.glob("events.out.tfevents.*"):
+            try:
+                if f.stat().st_size > 10_000:
+                    sized_files.append(f)
+            except OSError:
+                continue
+        if not sized_files:
+            continue
+        for f in sized_files:
+            try:
+                with open(f, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                continue
+            i, N = 0, len(data)
+            while i + 12 <= N:
+                ln = struct.unpack("<Q", data[i:i + 8])[0]
+                i += 12
+                if i + ln + 4 > N:
+                    break
+                try:
+                    ev = event_pb2.Event.FromString(data[i:i + ln])
+                    for v in ev.summary.value:
+                        if v.tag == tag:
+                            out.setdefault(ev.step, []).append(float(v.simple_value))
+                except Exception:
+                    pass
+                i += ln + 4
+    return out
+
+
+def _iqm_window_by_run_ids(tb_dir: Path, window_steps: int,
+                           run_ids: List[str],
+                           tag: str = "Eval/episodic_mean_reward",
+                           ) -> Optional[float]:
+    """Compute IQM over a specific set of seed-run subfolders, given by
+    name. The phase2/phase3 result JSONs each store the ``run_ids``
+    that backed their reported metric, so this is the ground-truth
+    way to recover the right subset of seeds even when the trial
+    folder has accumulated leftovers from killed-master retries or
+    when phase3's seeds are mixed in with phase2's.
+    """
+    if not tb_dir.is_dir():
+        return None
+    base = tb_dir / "tensorboard"
+    if not base.is_dir():
+        return None
+    wanted = set(run_ids)
+    sub_dirs = [p for p in base.iterdir() if p.is_dir() and p.name in wanted]
+    if not sub_dirs:
+        return None
+    out: dict = {}
+    try:
+        from tensorboardX.proto import event_pb2
+    except Exception:
+        return None
+    for sd in sub_dirs:
         for f in sd.glob("events.out.tfevents.*"):
             try:
                 with open(f, "rb") as fh:
@@ -313,17 +417,37 @@ def _read_seed_curves(tb_dir: Path) -> dict:
                 try:
                     ev = event_pb2.Event.FromString(data[i:i + ln])
                     for v in ev.summary.value:
-                        if v.tag == "Eval/episodic_mean_reward":
+                        if v.tag == tag:
                             out.setdefault(ev.step, []).append(float(v.simple_value))
                 except Exception:
                     pass
                 i += ln + 4
-    return out
+    if not out:
+        return None
+    counts = [len(v) for v in out.values()]
+    modal = max(set(counts), key=counts.count)
+    steps = sorted(s for s, v in out.items() if len(v) == modal)
+    if not steps:
+        return None
+    import numpy as _np
+    arr = _np.array([out[s] for s in steps], dtype=_np.float32)
+    last_step = steps[-1]
+    mask = _np.array([s >= last_step - window_steps for s in steps])
+    window = arr[mask]
+    if window.size == 0:
+        return None
+    per_seed = window.mean(axis=0)
+    sorted_seeds = _np.sort(per_seed)
+    n = len(sorted_seeds)
+    lo, hi = n // 4, (3 * n) // 4
+    return float(sorted_seeds[lo:hi].mean()) if hi > lo else float(sorted_seeds.mean())
 
 
 def _iqm_window_first_n(tb_dir: Path, window_steps: int,
                         max_seeds: Optional[int] = None,
-                        prefer: str = "newest") -> Optional[float]:
+                        prefer: str = "newest",
+                        tag: str = "Eval/episodic_mean_reward",
+                        ) -> Optional[float]:
     """Variant of ``_iqm_window`` that selects ``max_seeds`` seed subfolders.
 
     ``prefer="oldest"``: take the chronologically earliest subfolders.
@@ -343,7 +467,10 @@ def _iqm_window_first_n(tb_dir: Path, window_steps: int,
     sub_dirs = [p for p in base.iterdir() if p.is_dir()]
     if not sub_dirs:
         return None
-    # Order by max event-file mtime per subfolder.
+    # Order by max event-file mtime per subfolder, AND filter out empty
+    # stubs (subfolders from crashed-at-init workers that left a file
+    # but no eval data). Looking at file size alone is enough — a folder
+    # with no eval events has events files of just a few hundred bytes.
     def _max_event_mtime(sd: Path) -> float:
         m = 0.0
         for f in sd.glob("events.out.tfevents.*"):
@@ -352,6 +479,21 @@ def _iqm_window_first_n(tb_dir: Path, window_steps: int,
             except OSError:
                 continue
         return m
+
+    def _has_real_data(sd: Path) -> bool:
+        # A 1M-step run writes hundreds of KB; an init-only crash writes
+        # < 5 KB (just the file-version event header).
+        for f in sd.glob("events.out.tfevents.*"):
+            try:
+                if f.stat().st_size > 10_000:
+                    return True
+            except OSError:
+                continue
+        return False
+
+    sub_dirs = [sd for sd in sub_dirs if _has_real_data(sd)]
+    if not sub_dirs:
+        return None
     sub_dirs.sort(key=_max_event_mtime)
     if max_seeds is not None and len(sub_dirs) > max_seeds:
         if prefer == "oldest":
@@ -380,7 +522,7 @@ def _iqm_window_first_n(tb_dir: Path, window_steps: int,
                 try:
                     ev = event_pb2.Event.FromString(data[i:i + ln])
                     for v in ev.summary.value:
-                        if v.tag == "Eval/episodic_mean_reward":
+                        if v.tag == tag:
                             out.setdefault(ev.step, []).append(float(v.simple_value))
                 except Exception:
                     pass
@@ -406,7 +548,8 @@ def _iqm_window_first_n(tb_dir: Path, window_steps: int,
     return float(sorted_seeds[lo:hi].mean()) if hi > lo else float(sorted_seeds.mean())
 
 
-def _iqm_window(tb_dir: Path, window_steps: int) -> Optional[float]:
+def _iqm_window(tb_dir: Path, window_steps: int,
+                tag: str = "Eval/episodic_mean_reward") -> Optional[float]:
     """Per-seed mean over trailing ``window_steps`` env-steps, then IQM
     across seeds (drop top + bottom 25%, mean of middle 50%). Returns
     None on missing/empty TB events."""
@@ -422,10 +565,10 @@ def _iqm_window(tb_dir: Path, window_steps: int) -> Optional[float]:
                 latest_mtime = max(latest_mtime, f.stat().st_mtime)
     except FileNotFoundError:
         return None
-    cache_key = (str(tb_dir), int(window_steps), latest_mtime)
+    cache_key = (str(tb_dir), int(window_steps), tag, latest_mtime)
     if cache_key in _IQM_CACHE:
         return _IQM_CACHE[cache_key]
-    curves = _read_seed_curves(tb_dir)
+    curves = _read_seed_curves(tb_dir, tag=tag)
     if not curves:
         _IQM_CACHE[cache_key] = None
         return None
@@ -458,11 +601,16 @@ def _iqm_window(tb_dir: Path, window_steps: int) -> Optional[float]:
 
 
 def _hpo_best_iqm_per_phase(env: str, method: str,
+                            tag: str = "Eval/episodic_mean_reward",
                             ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     """IQM-equivalent of ``_hpo_best_per_phase``. For each phase, find the
     best trial by stored metric (mean of per-seed window means), then
     re-read its TB events and compute IQM across seeds. This is what the
-    paper actually reports."""
+    paper actually reports.
+
+    ``tag`` controls which TB scalar is reduced. Defaults to the trained
+    return; pass ``"Eval/expert_bias"`` to compute per-seed bias IQM
+    (rl_reward - expert_reward, computed seed-wise at log time)."""
     base = HP_RESULTS / env.lower() / method
     if not base.exists():
         return None, None, None
@@ -497,13 +645,17 @@ def _hpo_best_iqm_per_phase(env: str, method: str,
         except Exception:
             pass
     if best_p1_num is not None:
-        p1 = _iqm_window(base / f"trial_{best_p1_num:03d}_tb", 60_000)
+        p1 = _iqm_window(base / f"trial_{best_p1_num:03d}_tb", 60_000, tag=tag)
 
-    # Phase 2/3: best trial by JSON metric, IQM over phase2_tb (which
-    # holds phase2 + phase3 seeds combined).
+    # Phase 2/3: pick the best result JSON by metric, then read IQM
+    # over the EXACT run_ids the JSON itself recorded. This is robust
+    # to (a) phase3 having spawned its 50 seeds into the same TB
+    # folder as phase2 and (b) leftover empty subfolders from killed
+    # master retries. No mtime / file-size heuristics needed.
     import json as _json
-    def _best_trial_num(pattern: str) -> Optional[int]:
-        best_n, best_v = None, None
+    def _best_json(pattern: str):
+        """Return (trial_number, json_path) of the result with highest metric."""
+        best_n, best_v, best_path = None, None, None
         for f in base.glob(pattern):
             try:
                 r = _json.loads(f.read_text())
@@ -513,32 +665,47 @@ def _hpo_best_iqm_per_phase(env: str, method: str,
                 m = float(m)
                 if best_v is None or m > best_v:
                     best_v = m
-                    name = f.name  # trial_<n>_phaseN_result.json
-                    best_n = int(name.split("_")[1])
+                    best_n = int(f.name.split("_")[1])
+                    best_path = f
             except Exception:
                 pass
-        return best_n
+        return best_n, best_path
 
-    # Phase2: keep exactly HPO_PHASE2_SEEDS seed subfolders. If phase3
-    # has merged in additional seeds, the original phase2 ones are the
-    # oldest; otherwise the trial folder may have leftovers from killed
-    # master attempts, in which case the latest run is canonical.
-    n2 = _best_trial_num("trial_*_phase2_result.json")
-    if n2 is not None:
-        phase3_done_for_trial = (
-            base / f"trial_{n2:03d}_phase3_result.json"
-        ).exists()
-        p2 = _iqm_window_first_n(
-            base / f"trial_{n2:03d}_phase2_tb", 200_000,
-            max_seeds=HPO_PHASE2_SEEDS,
-            prefer="oldest" if phase3_done_for_trial else "newest",
-        )
-    # Phase3: read all seeds in trial_<n3>_phase2_tb (50 phase2 + 50 phase3
-    # = 100-seed combined headline number). Phase3 only writes JSON; its
-    # event files live alongside phase2's in the shared folder.
-    n3 = _best_trial_num("trial_*_phase3_result.json")
-    if n3 is not None:
-        p3 = _iqm_window(base / f"trial_{n3:03d}_phase2_tb", 200_000)
+    n2, p2_json_path = _best_json("trial_*_phase2_result.json")
+    if n2 is not None and p2_json_path is not None:
+        try:
+            run_ids = list(_json.loads(p2_json_path.read_text())
+                                .get("run_ids", []))
+        except Exception:
+            run_ids = []
+        if run_ids:
+            p2 = _iqm_window_by_run_ids(
+                base / f"trial_{n2:03d}_phase2_tb", 200_000, run_ids, tag=tag
+            )
+
+    n3, p3_json_path = _best_json("trial_*_phase3_result.json")
+    if n3 is not None and p3_json_path is not None:
+        # Phase3 reports the COMBINED 100-seed metric; build the union
+        # of phase2 + phase3 run_ids to match.
+        try:
+            r3 = _json.loads(p3_json_path.read_text())
+            run_ids_3 = list(r3.get("run_ids", []))
+        except Exception:
+            run_ids_3 = []
+        run_ids_combined = list(run_ids_3)
+        p2_companion = base / f"trial_{n3:03d}_phase2_result.json"
+        if p2_companion.exists():
+            try:
+                run_ids_combined += list(
+                    _json.loads(p2_companion.read_text()).get("run_ids", [])
+                )
+            except Exception:
+                pass
+        if run_ids_combined:
+            p3 = _iqm_window_by_run_ids(
+                base / f"trial_{n3:03d}_phase2_tb", 200_000,
+                run_ids_combined, tag=tag,
+            )
     return p1, p2, p3
 
 
@@ -735,64 +902,80 @@ def _unit_priority(kind: str, env: str, method: str,
     )
 
 
-def build_queue() -> "queue.PriorityQueue[WorkUnit]":
-    q: "queue.PriorityQueue[WorkUnit]" = queue.PriorityQueue()
+def build_unit_list() -> list[WorkUnit]:
+    """Return the full study-wide unit list, sorted by priority.
+
+    The list is *static* across the master's lifetime: GPU workers
+    rescan it on every iteration, skipping units already done on disk
+    (terminal artifact present) or already running elsewhere. This
+    means killing a unit mid-flight does NOT lose it: the next free
+    GPU re-picks it from the same list.
+    """
+    units: list[WorkUnit] = []
+    # Per-method env restriction. Methods restricted here only get
+    # built for the listed envs (skipped on others). Used for variants
+    # we only need on a single env for a targeted test.
+    _METHOD_ENV_RESTRICT = {
+        "edge_qa_optimistic": ("FourTank",),  # see METHODS comment
+    }
+    def _method_active_for(method: str, env: str) -> bool:
+        envs = _METHOD_ENV_RESTRICT.get(method)
+        return envs is None or env in envs
+
     # HPOs.
     for env in ENVS:
         for method in METHODS:
-            phase = _hpo_phase_status(env, method)
-            if phase == "done":
-                print(f"[skip] HPO already done (phase3 on disk): {env}/{method}")
+            if not _method_active_for(method, env):
                 continue
-            if phase != "phase1":
-                print(f"[resume] {env}/{method} at {phase} (phase1 done, "
-                      "re-dispatching same HPO master with --auto-phase3)")
-            q.put(WorkUnit(
+            units.append(WorkUnit(
                 priority=_unit_priority("hpo", env, method),
                 kind="hpo", env=env, method=method,
             ))
     # Degradation: every expert-using method. Reuses HPO-best params.
     degrade_methods = [
         m for m in METHODS
-        if m in ("edge", "sac_quality_aware", "ibrl", "jsrl", "jsrl_curriculum", "residual")
+        if m in ("edge", "sac_quality_aware", "edge_qa_optimistic",
+                 "ibrl", "jsrl", "jsrl_curriculum", "residual")
     ]
     for env in ENVS:
         for method in degrade_methods:
+            if not _method_active_for(method, env):
+                continue
             for sigma in DEGRADATION_SIGMAS:
-                if _degradation_done(env, method, sigma):
-                    print(
-                        f"[skip] degradation already done: "
-                        f"{env}/{method}/sigma={sigma}"
-                    )
-                    continue
-                q.put(WorkUnit(
+                units.append(WorkUnit(
                     priority=_unit_priority("degradation", env, method, sigma),
                     kind="degradation", env=env, method=method, sigma=sigma,
                 ))
-    # Decision-test ablation: bootstrap_lcb_gated on Plane3DCircle. Runs
-    # AFTER all Plane3DCircle primary HPO + degradation finish but BEFORE
-    # CheetahRun starts, so we know whether to flip edge-qa's default to
-    # include lcb_gated_bootstrap before paying the cost on envs 2-5. The
-    # priority gap (P3D primary tier ends at ~50_000, CheetahRun primary
-    # tier starts at 100_000) puts the unit in the boundary zone.
-    if not _ablation_done("Plane3DCircle", "bootstrap_lcb_gated"):
-        q.put(WorkUnit(
-            priority=90_000,
-            kind="ablation",
-            env="Plane3DCircle",
-            method="edge",
-            variant="bootstrap_lcb_gated",
-        ))
-    # EDGE design ablations (end of study; FourTank then CheetahRun).
+    # Decision-test ablation: bootstrap_lcb_gated on Plane3DCircle.
+    units.append(WorkUnit(
+        priority=90_000,
+        kind="ablation",
+        env="Plane3DCircle",
+        method="edge",
+        variant="bootstrap_lcb_gated",
+    ))
+    # EDGE design ablations.
     for env in ABLATION_ENVS:
         for variant in ABLATION_VARIANTS:
-            if _ablation_done(env, variant):
-                print(f"[skip] ablation already done: {env}/{variant}")
-                continue
-            q.put(WorkUnit(
-                priority=_unit_priority("ablation", env, "edge", variant=variant),
+            units.append(WorkUnit(
+                priority=_unit_priority("ablation", env, "edge",
+                                        variant=variant),
                 kind="ablation", env=env, method="edge", variant=variant,
             ))
+    units.sort()
+    return units
+
+
+def build_queue() -> "queue.PriorityQueue[WorkUnit]":
+    """Legacy adapter: keeps callers that expect a queue working.
+
+    The new GPUWorker pulls from a shared unit list directly; this
+    function is retained only so older entrypoints / tests / status
+    helpers keep importing.
+    """
+    q: "queue.PriorityQueue[WorkUnit]" = queue.PriorityQueue()
+    for u in build_unit_list():
+        q.put(u)
     return q
 
 
@@ -916,21 +1099,73 @@ def build_cmd(unit: WorkUnit, gpu_id: int) -> List[str]:
     raise ValueError(unit.kind)
 
 
+def _hpo_truly_done(env: str, method: str) -> bool:
+    """True iff (env, method) has a *real* phase3 result on disk.
+
+    A warm-start dispatch writes a placeholder phase3 result with
+    ``warm_start_status: in_progress`` and ``metric: NaN`` at the start
+    of training, so ``_hpo_phase_status`` reports "done" even while the
+    training is still in flight. That's what we want for the master's
+    "skip re-dispatch" check (race protection), but degradation /
+    ablation must NOT fire against an in-progress placeholder, so they
+    use this stricter check.
+    """
+    base = HP_RESULTS / env.lower() / method
+    if not base.exists():
+        return False
+    import json as _json
+    import math as _math
+    for r in base.glob("trial_*_phase3_result.json"):
+        try:
+            d = _json.loads(r.read_text())
+        except Exception:
+            continue
+        status = d.get("warm_start_status")
+        if status == "in_progress":
+            continue
+        metric = d.get("metric")
+        if metric is None or (isinstance(metric, float) and _math.isnan(metric)):
+            continue
+        return True
+    return False
+
+
 def _unit_eligible(unit: "WorkUnit") -> bool:
     """True if this unit can actually be dispatched right now.
 
-    Degradation/ablation depend on their target method having at least
-    one complete HPO trial (best-config lookup); pulling them earlier
-    just hard-fails. Gate at dispatch time so the unit gets requeued
-    instead of consumed.
+    Degradation/ablation depend on their target method having a fully
+    complete HPO unit (real phase3 result, NOT a warm-start placeholder
+    whose final metric is still NaN). Gate at dispatch time so the
+    unit gets requeued instead of consumed.
     """
     if unit.kind == "degradation":
-        n = _hpo_trial_count(unit.env, unit.method)
-        return bool(n and n >= 1)
+        return _hpo_truly_done(unit.env, unit.method)
     if unit.kind == "ablation":
         # Ablations clone edge-qa best params on the same env.
-        n = _hpo_trial_count(unit.env, "sac_quality_aware")
-        return bool(n and n >= 1)
+        return _hpo_truly_done(unit.env, "sac_quality_aware")
+    return True
+
+
+def _unit_complete_on_disk(unit: "WorkUnit") -> bool:
+    """True iff this work unit's terminal artifact is on disk.
+
+    Used by the GPUWorker to decide whether a non-zero dispatch exit
+    should requeue the unit (incomplete -> retry, e.g. master killed
+    for an online code fix) or drop it (complete -> nothing more to do,
+    e.g. a phase3 result already exists and the rerun was a no-op).
+    """
+    if unit.kind == "hpo":
+        # Use _hpo_truly_done so a warm-start placeholder result
+        # (metric=NaN, warm_start_status=in_progress) does NOT count as
+        # complete. Race protection for the in-flight warm-start is
+        # handled by _unit_already_running's ps scan, not by this
+        # check, so requiring a real metric here is safe.
+        return _hpo_truly_done(unit.env, unit.method)
+    if unit.kind == "degradation":
+        return _degradation_done(unit.env, unit.method, float(unit.sigma))
+    if unit.kind == "ablation":
+        out = ABLATION_RESULTS / f"{unit.env.lower()}__{unit.variant}.json"
+        return out.exists()
     return True
 
 
@@ -957,8 +1192,17 @@ def dispatch(unit: WorkUnit, gpu_id: int) -> int:
     so a Ctrl-C on the master also propagates immediately.
     """
     cmd = build_cmd(unit, gpu_id)
+    is_hpo_master = (unit.kind == "hpo")
     log_path = _log_path(unit)
     env = _env_with_gpu(gpu_id)
+    if is_hpo_master:
+        # The HPO master never trains: it only runs Optuna's TPE sampler,
+        # spawns worker subprocesses, and reads TB events for pruning.
+        # Force it to CPU so it doesn't claim ~10 GB of GPU memory just
+        # for JAX init. The worker subprocess (spawned via
+        # sac_hyperparam_search._spawn_worker) explicitly pops
+        # JAX_PLATFORMS, so workers still use the GPU normally.
+        env["JAX_PLATFORMS"] = "cpu"
     with open(log_path, "w") as log:
         log.write(f"[master] launching {unit.name()} on GPU {gpu_id}\n")
         log.write(f"[master] cmd: {' '.join(cmd)}\n")
@@ -978,47 +1222,72 @@ def dispatch(unit: WorkUnit, gpu_id: int) -> int:
 
 
 class GPUWorker(threading.Thread):
-    def __init__(self, gpu_id: int, work_q: "queue.PriorityQueue[WorkUnit]",
-                 done_counter: dict, done_lock: threading.Lock):
+    """One worker thread per GPU.
+
+    Instead of consuming a one-shot queue, every iteration rescans the
+    shared (static) unit list from the top in priority order, picking
+    the first one that is:
+      - not already done on disk (terminal artifact missing),
+      - not already running elsewhere (ps scan),
+      - not currently dispatched by a sibling GPU worker (in-memory
+        ``in_progress`` set guarded by ``pick_lock``),
+      - eligible (HPO prereqs met for degradation/ablation).
+
+    This means killing a mid-flight unit (e.g. for an online code fix)
+    is harmless: the next free GPU re-picks the same unit from the top
+    of the list. No per-unit retry counter, no requeue plumbing — the
+    list IS the source of truth, scanned fresh every time.
+    """
+
+    def __init__(self, gpu_id: int, units: list[WorkUnit],
+                 in_progress: set, pick_lock: threading.Lock,
+                 done_counter: dict, done_lock: threading.Lock,
+                 stop_event: threading.Event):
         super().__init__(daemon=True, name=f"gpu-{gpu_id}")
         self.gpu_id = gpu_id
-        self.work_q = work_q
+        self.units = units
+        self.in_progress = in_progress
+        self.pick_lock = pick_lock
         self.done_counter = done_counter
         self.done_lock = done_lock
+        self.stop_event = stop_event
+
+    def _pick_next(self) -> Optional[WorkUnit]:
+        """Atomically scan the unit list and claim the first runnable unit.
+
+        Returns None if no unit is currently runnable (everything is
+        either done, running, or ineligible). Caller should sleep and
+        retry. The claimed unit is added to ``in_progress`` under the
+        pick_lock so sibling GPUs don't double-claim it.
+        """
+        with self.pick_lock:
+            for unit in self.units:
+                if unit.name() in self.in_progress:
+                    continue
+                if _unit_complete_on_disk(unit):
+                    continue
+                if _unit_already_running(unit):
+                    continue
+                if not _unit_eligible(unit):
+                    continue
+                self.in_progress.add(unit.name())
+                return unit
+        return None
 
     def run(self):
-        while True:
+        IDLE_SLEEP_S = 30  # rescan cadence when nothing is runnable
+        while not self.stop_event.is_set():
+            unit = self._pick_next()
+            if unit is None:
+                # Nothing to dispatch right now. Either we are done
+                # (loop terminates via _all_done check below), or the
+                # remaining units are blocked (ineligible / running on
+                # other GPUs). Sleep and rescan.
+                if self._all_done():
+                    return
+                time.sleep(IDLE_SLEEP_S)
+                continue
             try:
-                unit = self.work_q.get(timeout=2)
-            except queue.Empty:
-                return
-            try:
-                # Race guard: if some other process (orphan master from
-                # a previous run, or a manual launch) is already running
-                # this exact unit, skip — we'd otherwise spawn a duplicate
-                # that races on the same Optuna study / result files.
-                if _unit_already_running(unit):
-                    print(f"[gpu{self.gpu_id}] skip {unit.name()} "
-                          "(already running elsewhere)")
-                    with self.done_lock:
-                        self.done_counter["SKIP_RUNNING"] = (
-                            self.done_counter.get("SKIP_RUNNING", 0) + 1
-                        )
-                    continue
-                # Eligibility gate: requeue (with a priority nudge) and
-                # try the next unit if this one's prerequisites aren't
-                # met yet (e.g. degradation before any HPO trial done).
-                if not _unit_eligible(unit):
-                    print(f"[gpu{self.gpu_id}] defer {unit.name()} "
-                          "(prereq not met; requeuing)")
-                    deferred = WorkUnit(
-                        priority=unit.priority + 1,
-                        kind=unit.kind, env=unit.env, method=unit.method,
-                        sigma=unit.sigma, variant=unit.variant,
-                    )
-                    self.work_q.put(deferred)
-                    time.sleep(15)  # avoid tight requeue loop
-                    continue
                 print(f"[gpu{self.gpu_id}] picked {unit.name()}")
                 wait_until_gpu_free(self.gpu_id)
                 ret = dispatch(unit, self.gpu_id)
@@ -1028,10 +1297,18 @@ class GPUWorker(threading.Thread):
                     self.done_counter[status] = (
                         self.done_counter.get(status, 0) + 1
                     )
+                # Nothing to do on FAIL: next iteration rescans, and if
+                # the terminal artifact is still missing the same unit
+                # gets re-picked automatically (by us or a sibling GPU).
             except Exception as e:
                 print(f"[gpu{self.gpu_id}] {unit.name()} raised {e!r}")
             finally:
-                self.work_q.task_done()
+                with self.pick_lock:
+                    self.in_progress.discard(unit.name())
+
+    def _all_done(self) -> bool:
+        """True when every unit in the list is complete on disk."""
+        return all(_unit_complete_on_disk(u) for u in self.units)
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1506,89 @@ def _hpo_steps_per_sec(env: str, method: str) -> Optional[float]:
     return float(delta_steps) / span
 
 
+def _phase_completed_metrics(env: str, method: str,
+                             ) -> dict:
+    """Per-phase ``{wall_sec, steps_per_sec, n_trials}`` for finished trials.
+
+    Returns ``{'phase1': {...}, 'phase2': {...}, 'phase3': {...}}``,
+    populated only for phases that actually have completed trials on
+    disk. Used by ``--status`` so the HPO column shows the cumulative
+    wall-time and average per-seed throughput retrospectively.
+
+    Throughput is *per-seed env-steps/sec* (so it matches the live
+    "X st/s" number reported for in-flight trials), not aggregate.
+    """
+    base = HP_RESULTS / env.lower() / method
+    out: dict = {}
+
+    # Phase1: from Optuna db trial start/complete timestamps.
+    db = base / "optuna.db"
+    p1_durs: list[float] = []
+    if db.exists():
+        try:
+            import optuna
+            from optuna.trial import TrialState
+            s = optuna.load_study(
+                study_name=_study_name(env, method),
+                storage=f"sqlite:///{db}",
+            )
+            for t in s.trials:
+                if (t.state == TrialState.COMPLETE
+                        and t.datetime_start and t.datetime_complete):
+                    p1_durs.append(
+                        (t.datetime_complete - t.datetime_start).total_seconds()
+                    )
+        except Exception:
+            pass
+    if p1_durs:
+        total = float(sum(p1_durs))
+        n = len(p1_durs)
+        # Per-trial budget = phase1_timesteps; total per-seed steps =
+        # n_trials × phase1_timesteps. Aggregate wall = total.
+        rate = (n * HPO_PHASE1_TIMESTEPS) / total if total > 0 else 0.0
+        out["phase1"] = {
+            "wall_sec": total, "steps_per_sec": rate, "n_trials": n,
+        }
+
+    # Phase2/3: read each result JSON's ``elapsed_s`` (the worker
+    # writes it at trial-end and is the authoritative wall duration;
+    # filesystem ctime is unreliable as it changes with metadata
+    # writes). Per-seed throughput = n_timesteps / elapsed_s.
+    import json as _json
+
+    def _accumulate(pattern: str) -> Optional[dict]:
+        total_wall = 0.0
+        total_steps = 0
+        n = 0
+        for r in base.glob(pattern):
+            try:
+                d = _json.loads(r.read_text())
+                wall = float(d.get("elapsed_s") or 0.0)
+                n_steps = int(d.get("n_timesteps") or HPO_PHASE2_TIMESTEPS)
+                if wall <= 0:
+                    continue
+                total_wall += wall
+                total_steps += n_steps
+                n += 1
+            except Exception:
+                pass
+        if n == 0 or total_wall <= 0:
+            return None
+        return {
+            "wall_sec": total_wall,
+            "steps_per_sec": total_steps / total_wall,
+            "n_trials": n,
+        }
+
+    p2 = _accumulate("trial_*_phase2_result.json")
+    if p2:
+        out["phase2"] = p2
+    p3 = _accumulate("trial_*_phase3_result.json")
+    if p3:
+        out["phase3"] = p3
+    return out
+
+
 def _empirical_phase_durations(env: str, method: str,
                                ) -> Tuple[Optional[float], Optional[float]]:
     """Return ``(median_phase1_sec, median_phase2_sec)`` from Optuna trial
@@ -1358,22 +1718,44 @@ def print_status() -> None:
             abl_running_by_env[key[1]] = abl_running_by_env.get(key[1], 0) + 1
 
     print(
-        f"{'env':<20} {'method':<10} {'HPO':<32} "
+        f"{'env':<20} {'method':<10} {'HPO':<44} "
         f"{'p1 bias (n/N)':>16} {'p2 bias (n/N)':>16} {'p3 bias':>10} {'DEG':<8}"
     )
-    print("-" * 118)
+    print("-" * 130)
     n_hpo_done = n_deg_done = 0
     n_hpo_total = n_deg_total = 0
     total_remaining_sec = 0  # sum of remaining time across all pending/running units
     for env in ENVS:
         for i, method in enumerate(METHODS):
-            hpo_done = _hpo_db_complete(env, method)
-            # HPO column. Trial-count and "done" state are now redundant
-            # with the (n/N) suffix on each phase column, so we strip
-            # them here and keep only the GPU + ETA + live E/T metrics
-            # that aren't visible elsewhere.
+            # ``hpo_done`` here means the *unit* is complete (phase3
+            # result on disk), NOT just that the optuna db has 30
+            # phase1 trials. The previous check (_hpo_db_complete)
+            # returned True as soon as phase1 hit HPO_TRIALS, which
+            # made the status row collapse to the retrospective
+            # ``p1=...`` line even while phase2 / phase3 were
+            # actively training; ``_hpo_phase_status == 'done'`` only
+            # flips once phase3 actually lands its result JSON.
+            hpo_phase = _hpo_phase_status(env, method)
+            hpo_done = (hpo_phase == "done")
+            # Per-phase finished-run summary (cumulative wall-time).
+            # Shown for both running and done units so finished phases
+            # keep their retrospective cost on screen even after the
+            # master moves on.
+            phase_done = _phase_completed_metrics(env, method)
+
+            def _phase_summary() -> str:
+                parts = []
+                for key in ("phase1", "phase2", "phase3"):
+                    m = phase_done.get(key)
+                    if not m:
+                        continue
+                    short = {"phase1": "p1", "phase2": "p2",
+                             "phase3": "p3"}[key]
+                    parts.append(f"{short}={_fmt_hms(int(m['wall_sec']))}")
+                return " ".join(parts)
+
             if hpo_done:
-                hpo_str = ""
+                hpo_str = _phase_summary()
             elif (env, method) in hpo_running:
                 pid, gpu, et = hpo_running[(env, method)]
                 n_done = _hpo_trial_count(env, method) or 0
@@ -1381,12 +1763,22 @@ def print_status() -> None:
                     n_done, _parse_etime(et), env=env, method=method
                 )
                 hpo_str = f"gpu{gpu} ETA{_fmt_hms(eta_sec)}"
+                # Live throughput from TB wall-clock between checkpoints
+                # (excludes JAX compile by skipping the first eval). Tells
+                # you "how fast is this trial currently running" rather
+                # than the latest reward, which is already implied by the
+                # bias columns to the right.
+                rate = _hpo_steps_per_sec(env, method)
                 inflight = _hpo_inflight_metric(env, method)
-                if inflight is not None:
-                    eval_m, train_m, step = inflight
-                    eval_s = f"E={eval_m:.0f}" if eval_m is not None else "E=-"
-                    train_s = f"T={train_m:.0f}" if train_m is not None else "T=-"
-                    hpo_str += f" ({eval_s}/{train_s}@{step//1000}k)"
+                step_k = (inflight[2] // 1000) if inflight else None
+                rate_s = f"{rate:.0f} st/s" if rate else "- st/s"
+                step_s = f"@{step_k}k" if step_k is not None else ""
+                hpo_str += f" ({rate_s}{step_s})"
+                # Append finished-phase summary so we keep historical
+                # cost visible alongside the live throughput.
+                summary = _phase_summary()
+                if summary:
+                    hpo_str += f"  [{summary}]"
                 total_remaining_sec += eta_sec
             else:
                 hpo_str = ""
@@ -1395,7 +1787,14 @@ def print_status() -> None:
                 # else fall back to the static default. Conservative.
                 pending_eta = _hpo_eta_seconds(0, 0, env=env, method=method)
                 total_remaining_sec += pending_eta
-            p1_best, p2_best, p3_best = _hpo_best_iqm_per_phase(env, method)
+            # Read Eval/expert_bias directly from TB. Per-seed bias
+            # (rl_reward[seed] - expert_reward[seed]) is logged at eval
+            # time inside Ajax (see ajax/log.py:199), so the IQM here is
+            # the seed-wise bias IQM, not (rl IQM - expert reference).
+            # This is robust to expert-reference drift / unit mismatches.
+            p1_best, p2_best, p3_best = _hpo_best_iqm_per_phase(
+                env, method, tag="Eval/expert_bias"
+            )
             # Per-phase completion counts. Phase1 = COMPLETE Optuna trials
             # vs HPO_TRIALS target; phase2/3 = result-JSON counts vs the
             # top-K and top-1 targets respectively.
@@ -1410,25 +1809,14 @@ def print_status() -> None:
                 if _hp_base.exists() else 0
             )
 
-            # Subtract the expert reference so the column reports
-            # expert-bias (= policy − expert) directly. Sign carries
-            # info: + means the policy beats the expert.
-            _exp_ref = EXPERT_REFERENCE.get(env)
-
-            def _bias(v: Optional[float]) -> Optional[float]:
-                if v is None or _exp_ref is None:
-                    return v
-                return v - _exp_ref
-
             def _fmt(v: Optional[float], n: int, target: int,
                      show_count: bool = True) -> str:
                 width = 16 if show_count else 10
-                b = _bias(v)
-                if b is None:
+                if v is None:
                     return f"{'-':>{width}}"
                 if show_count:
-                    return f"{b:+9.2f} ({n}/{target})"
-                return f"{b:+9.2f}"
+                    return f"{v:+9.2f} ({n}/{target})"
+                return f"{v:+9.2f}"
             p1_str = _fmt(p1_best, n_p1, HPO_TRIALS)
             p2_str = _fmt(p2_best, n_p2, HPO_TOP_K)
             # Phase 3 is always a single top-1 rerun, no count needed.
@@ -1453,7 +1841,7 @@ def print_status() -> None:
                 deg_str = "n/a"
             disp = _METHOD_DISPLAY.get(method, method)
             print(
-                f"{env:<20} {disp:<10} {hpo_str:<32} "
+                f"{env:<20} {disp:<10} {hpo_str:<44} "
                 f"{p1_str:>16} {p2_str:>16} {p3_str:>10} {deg_str:<8}"
             )
             n_hpo_total += 1
@@ -1554,23 +1942,35 @@ def main():
     ABLATION_RESULTS.mkdir(parents=True, exist_ok=True)
 
     print("[master] scanning existing artifacts")
-    q = build_queue()
-    total = q.qsize()
-    print(f"[master] {total} pending work units on GPUs {args.gpus}")
+    units = build_unit_list()
+    pending = [u for u in units if not _unit_complete_on_disk(u)]
+    print(f"[master] {len(pending)}/{len(units)} pending work units "
+          f"(static list, rescanned each iteration) on GPUs {args.gpus}")
     if args.dry_run:
-        while not q.empty():
-            print(f"  {q.get().name()}")
+        for u in pending:
+            print(f"  {u.name()}")
         return
 
     done_counter: dict = {}
     done_lock = threading.Lock()
+    pick_lock = threading.Lock()
+    in_progress: set = set()
+    stop_event = threading.Event()
     workers = [
-        GPUWorker(g, q, done_counter, done_lock) for g in args.gpus
+        GPUWorker(g, units, in_progress, pick_lock,
+                  done_counter, done_lock, stop_event)
+        for g in args.gpus
     ]
     for w in workers:
         w.start()
-    for w in workers:
-        w.join()
+    try:
+        for w in workers:
+            w.join()
+    except KeyboardInterrupt:
+        print("[master] interrupt received, stopping workers")
+        stop_event.set()
+        for w in workers:
+            w.join()
 
     print("[master] all workers finished")
     print(f"[master] summary: {dict(done_counter)}")

@@ -34,7 +34,12 @@ def rollout_one(env, env_params, expert, key):
         )
         return (new_obs, new_state, new_expert_state, ret, done_next), None
 
-    max_steps = int(env_params.max_steps_in_episode)
+    # max_steps_in_episode is in physics-step units (matches gymnax's
+    # truncation contract). For envs that internally sub-step physics
+    # per env-step (e.g. Reactor: CONTROL_PERIOD=10 sub-steps per env-step),
+    # the number of env-step calls is max_steps_in_episode // sub_steps.
+    sub_steps = getattr(env, "control_period", 1)
+    max_steps = int(env_params.max_steps_in_episode) // int(sub_steps)
     init = (obs, state, expert_state, jnp.float32(0.0), jnp.bool_(False))
     (_, _, _, ret, _), _ = jax.lax.scan(
         lambda c, _: body(c, step_key), init, xs=None, length=max_steps
@@ -50,7 +55,8 @@ def eval_env(env_name: str, n_seeds: int):
     returns = jnp.stack([rollout(k) for k in keys])
     returns = jax.device_get(returns)
     print(f"  [debug] per-seed returns: {returns.tolist()}")
-    max_steps = int(env_params.max_steps_in_episode)
+    sub_steps = getattr(env, "control_period", 1)
+    max_steps = int(env_params.max_steps_in_episode) // int(sub_steps)
     return {
         "env": env_name,
         "mean": float(returns.mean()),

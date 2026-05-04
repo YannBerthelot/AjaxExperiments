@@ -82,8 +82,22 @@ paper/*.toc
 paper/*.nav
 paper/*.snm
 paper/*.vrb
+# (also catch root-level latex artifacts produced by stray builds)
+*.aux
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
 *.fdb_latexmk
 
 # Agent context (local-only working files)
 todo.md
 **/CLAUDE.md
+
+COMMANDS.md
+paper/paper_stash.tex
+preserved_params/
+recompute_phase1_window.py
+warm_start_r_edge_bow.py
+watch_sac_qa_p3d_phase23.py

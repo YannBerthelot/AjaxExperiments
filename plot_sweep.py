@@ -3974,6 +3974,17 @@ _PAPER_EXPERT: dict[str, float] = {
     "BarkourJoystick": 6.6,
 }
 
+# Empirical upper bound J*: best return achieved by any method on the
+# task. Used to normalize the expert bias to the headroom-fraction
+# metric \tilde{\Delta} = (J - J_exp) / (J* - J_exp) (Eq. 1 in the
+# paper). Fall back to expert + 5130 ≈ IBRL P3D phase3 calibration if
+# unset, so curves don't crash on partial-data envs.
+_PAPER_J_STAR: dict[str, float] = {
+    # Plane3DCircle: best phase3 IQM is jsrl-tt = 9650.8; round up to
+    # 10000 so headroom-fraction stays interpretable.
+    "Plane3DCircle": 10000.0,
+}
+
 # Methods to plot in the paper, in the canonical legend order. Colors
 # pulled from the project PALETTE so paper figures match the rest of
 # the codebase. The proposed method (EDGE) gets the teal-green slot;
@@ -3982,7 +3993,8 @@ _PAPER_METHODS: list[tuple[str, str, str]] = [
     # (method_dir, display_label, color)
     ("sac",                "SAC",        "#5D6D7E"),  # slate grey
     ("ibrl",               "IBRL",       "#9B59B6"),  # violet
-    ("jsrl",               "JSRL",       "#E8A820"),  # amber
+    ("jsrl_curriculum",    "JSRL",       "#E8A820"),  # amber (canonical Uchendu 2023)
+    ("jsrl",               "JSRL-tt",    "#C0392B"),  # red (training-time variant)
     ("residual",           "Residual",   "#F4762A"),  # orange
     ("sac_quality_aware",  "EDGE",       "#1A9B6C"),  # teal green (proposed)
 ]
@@ -4019,15 +4031,52 @@ def _paper_iter_tb_events_at(tb_root: Path):
                 i += ln + 4
 
 
-def _paper_read_seed_curves(tb_root: Path, tag: str) -> dict[int, list[float]]:
+def _paper_read_seed_curves(
+    tb_root: Path, tag: str,
+    run_ids: Optional[list[str]] = None,
+) -> dict[int, list[float]]:
     """Read all values for ``tag`` from ``tb_root``, grouping by step.
 
     Returns ``{step: [v0, v1, ...]}`` where the list is across the
     different ``run_id`` sub-folders (one per seed in the vmap call).
-    No assumption that all seeds report at every step (some might be
-    pruned mid-trial).
+
+    When ``run_ids`` is provided, only sub-folders whose name matches
+    one of the given run_ids are read. This is the robust way to
+    recover the canonical phase2 (50-seed) or phase2+phase3 (100-seed)
+    curve when the trial folder also contains in-flight phase3 seeds
+    or empty stubs from killed-master retries.
     """
     out: dict[int, list[float]] = {}
+    base = tb_root / "tensorboard"
+    if not base.is_dir():
+        return out
+    if run_ids is not None:
+        wanted = set(run_ids)
+        from tensorboardX.proto import event_pb2  # type: ignore
+        for sd in sorted(base.iterdir()):
+            if not sd.is_dir() or sd.name not in wanted:
+                continue
+            for f in sorted(sd.glob("events.out.tfevents.*")):
+                try:
+                    with open(f, "rb") as fh:
+                        data = fh.read()
+                except OSError:
+                    continue
+                i, N = 0, len(data)
+                while i + 12 <= N:
+                    ln = struct.unpack("<Q", data[i:i + 8])[0]
+                    i += 12
+                    if i + ln + 4 > N:
+                        break
+                    try:
+                        ev = event_pb2.Event.FromString(data[i:i + ln])
+                        for v in ev.summary.value:
+                            if v.tag == tag:
+                                out.setdefault(ev.step, []).append(float(v.simple_value))
+                    except Exception:
+                        pass
+                    i += ln + 4
+        return out
     for step, t, val in _paper_iter_tb_events_at(tb_root):
         if t == tag:
             out.setdefault(step, []).append(float(val))
@@ -4054,11 +4103,78 @@ def _paper_curves_to_array(
     return np.asarray(steps, dtype=np.int64), values
 
 
-def _paper_best_trial_tb(env_slug: str, method: str) -> Optional[Path]:
-    """Find the trial folder of the BEST completed Optuna trial for the
-    given (env, method). Prefers ``trial_<n>_phase2_tb`` (phase2/3 combined
-    100 seeds) when present, else ``trial_<n>_tb`` (phase1 only)."""
-    db = _PAPER_HP_RESULTS / env_slug / method / "optuna.db"
+def _paper_best_trial_tb(
+    env_slug: str, method: str,
+) -> Optional[tuple[Path, Optional[list[str]]]]:
+    """Return ``(tb_folder, run_ids)`` for the BEST trial.
+
+    ``run_ids`` is the list of seed-subfolder names that the JSON
+    metric was computed over (50 for phase2, 100 for phase2 ∪ phase3,
+    None for phase1-only fallback). Callers must filter their TB read
+    by these run_ids to avoid mixing in phase3-in-progress seeds or
+    leftover stubs from killed-master retries.
+
+    Selection order:
+      1. If any ``trial_*_phase3_result.json`` exists, pick the trial
+         whose phase3 metric is highest. run_ids = phase3 ∪ phase2.
+      2. Else if any ``trial_*_phase2_result.json`` exists, pick the
+         trial with the highest phase2 metric. run_ids = phase2.
+      3. Else fall back to the best Optuna phase1 trial.value (or
+         recomputed_p1_60k.json sidecar) and use its trial_<n>_tb;
+         no run_id filter.
+    """
+    base = _PAPER_HP_RESULTS / env_slug / method
+    if not base.exists():
+        return None
+
+    def _best_by_json(pattern: str):
+        best_n, best_v, best_path = None, None, None
+        for f in base.glob(pattern):
+            try:
+                r = json.loads(f.read_text())
+                m = r.get("metric")
+                if m is None:
+                    continue
+                m = float(m)
+                if best_v is None or m > best_v:
+                    best_v = m
+                    best_n = int(f.name.split("_")[1])
+                    best_path = f
+            except Exception:
+                pass
+        return best_n, best_path
+
+    n3, p3_json = _best_by_json("trial_*_phase3_result.json")
+    if n3 is not None and p3_json is not None:
+        p2_dir = base / f"trial_{n3:03d}_phase2_tb"
+        if p2_dir.is_dir():
+            run_ids: list[str] = []
+            try:
+                run_ids += list(json.loads(p3_json.read_text())
+                                    .get("run_ids", []))
+            except Exception:
+                pass
+            p2_companion = base / f"trial_{n3:03d}_phase2_result.json"
+            if p2_companion.exists():
+                try:
+                    run_ids += list(json.loads(p2_companion.read_text())
+                                        .get("run_ids", []))
+                except Exception:
+                    pass
+            return p2_dir, (run_ids if run_ids else None)
+
+    n2, p2_json = _best_by_json("trial_*_phase2_result.json")
+    if n2 is not None and p2_json is not None:
+        p2_dir = base / f"trial_{n2:03d}_phase2_tb"
+        if p2_dir.is_dir():
+            try:
+                rid = list(json.loads(p2_json.read_text())
+                              .get("run_ids", []))
+            except Exception:
+                rid = []
+            return p2_dir, (rid if rid else None)
+
+    db = base / "optuna.db"
     if not db.exists():
         return None
     try:
@@ -4072,13 +4188,18 @@ def _paper_best_trial_tb(env_slug: str, method: str) -> Optional[Path]:
     completed = [t for t in s.trials if t.value is not None]
     if not completed:
         return None
-    best = max(completed, key=lambda t: t.value)
-    base = _PAPER_HP_RESULTS / env_slug / method
-    p2 = base / f"trial_{best.number:03d}_phase2_tb"
-    if p2.is_dir():
-        return p2
+    sidecar_path = base / "recomputed_p1_60k.json"
+    sidecar = {}
+    if sidecar_path.exists():
+        try:
+            sidecar = json.loads(sidecar_path.read_text())
+        except Exception:
+            sidecar = {}
+    best = max(
+        completed, key=lambda t: sidecar.get(str(t.number), t.value)
+    )
     p1 = base / f"trial_{best.number:03d}_tb"
-    return p1 if p1.is_dir() else None
+    return (p1, None) if p1.is_dir() else None
 
 
 def _paper_render_curves(
@@ -4087,6 +4208,7 @@ def _paper_render_curves(
     smooth: int = 5,
     aggregation: str = "iqm",
     out_path: Optional[Path] = None,
+    skip_methods: tuple = ("sac",),
 ) -> Optional[Path]:
     """Per-env learning curve, one line per method (best HPO trial).
 
@@ -4098,18 +4220,25 @@ def _paper_render_curves(
     fig, ax = plt.subplots(figsize=(6.5, 4.2))
     plotted = False
     for method, label, color in _PAPER_METHODS:
-        tb = _paper_best_trial_tb(env_slug, method)
-        if tb is None:
+        if method in skip_methods:
             continue
-        curves = _paper_read_seed_curves(tb, metric)
+        sel = _paper_best_trial_tb(env_slug, method)
+        if sel is None:
+            continue
+        tb, run_ids = sel
+        curves = _paper_read_seed_curves(tb, metric, run_ids=run_ids)
         steps, values = _paper_curves_to_array(curves)
         if values.size == 0:
             continue
         if smooth > 1:
-            kernel = np.ones(smooth) / smooth
-            values = np.apply_along_axis(
-                lambda v: np.convolve(v, kernel, mode="same"), 0, values
-            )
+            # Centered rolling mean with min_periods=1 so boundary
+            # points are averaged over the available window instead of
+            # zero-padded (np.convolve mode="same" pads with zeros,
+            # which produces a visible downward dip at the end of the
+            # curve). pandas handles edges cleanly.
+            values = pd.DataFrame(values).rolling(
+                window=smooth, min_periods=1, center=True,
+            ).mean().values
         if aggregation == "iqm":
             central = _iqm(values)
         else:
@@ -4157,6 +4286,81 @@ def _paper_render_bias(env: str, smooth: int = 5,
                                  smooth=smooth, aggregation=aggregation)
 
 
+def _paper_render_norm_bias(env: str, smooth: int = 5,
+                            aggregation: str = "iqm",
+                            skip_methods: tuple = ("sac",),
+                            ) -> Optional[Path]:
+    """Per-env *normalized* expert-bias curve.
+
+    Plots $\\tilde{\\Delta} = (J - J_{\\mathrm{exp}}) /
+    (J^* - J_{\\mathrm{exp}})$ over training (Eq. 1 in the paper).
+    The ratio uses ``_PAPER_J_STAR`` for the upper bound; envs without
+    a registered $J^*$ fall back to the unnormalized bias plot. Output
+    file: ``curves_<env>_normalized_expert_bias.pdf``.
+    """
+    _paper_apply_style()
+    env_slug = env.lower()
+    expert = _PAPER_EXPERT.get(env)
+    j_star = _PAPER_J_STAR.get(env)
+    if expert is None or j_star is None or (j_star - expert) <= 0:
+        return _paper_render_bias(env, smooth=smooth, aggregation=aggregation)
+    headroom = j_star - expert
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    plotted = False
+    for method, label, color in _PAPER_METHODS:
+        if method in skip_methods:
+            continue
+        sel = _paper_best_trial_tb(env_slug, method)
+        if sel is None:
+            continue
+        tb, run_ids = sel
+        # Normalize on the per-seed return curves so the bootstrap CI
+        # propagates correctly (linear transform; preserves IQR).
+        curves = _paper_read_seed_curves(
+            tb, "Eval/episodic_mean_reward", run_ids=run_ids,
+        )
+        steps, values = _paper_curves_to_array(curves)
+        if values.size == 0:
+            continue
+        values = (values - expert) / headroom
+        if smooth > 1:
+            # Same boundary-safe smoothing as in _paper_render_curves.
+            values = pd.DataFrame(values).rolling(
+                window=smooth, min_periods=1, center=True,
+            ).mean().values
+        central = (_iqm(values) if aggregation == "iqm"
+                   else values.mean(axis=1))
+        lo, hi = bootstrap_ci(values, aggregation=aggregation)
+        is_proposed = method == "sac_quality_aware"
+        ax.plot(steps, central, color=color,
+                lw=2.4 if is_proposed else 1.6,
+                label=label, zorder=3 if is_proposed else 2)
+        ax.fill_between(steps, lo, hi, color=color,
+                        alpha=0.18 if is_proposed else 0.10,
+                        linewidth=0,
+                        zorder=2 if is_proposed else 1)
+        plotted = True
+    if not plotted:
+        plt.close(fig)
+        return None
+    # Reference lines: 0 = expert parity, 1 = empirical upper bound.
+    ax.axhline(0.0, color="#888888", ls=":", lw=1.0,
+               label="expert ($\\tilde{\\Delta}=0$)")
+    ax.axhline(1.0, color="#444444", ls="--", lw=0.8, alpha=0.6,
+               label="$J^*$ ($\\tilde{\\Delta}=1$)")
+    ax.set_xlabel("environment steps")
+    ax.set_ylabel("$\\tilde{\\Delta}$  (expert-normalized advantage)")
+    ax.set_title(env, pad=6)
+    ax.grid(axis="both")
+    ax.legend(loc="lower right", fontsize=8.5)
+    _PAPER_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = _PAPER_OUT_DIR / f"curves_{env_slug}_normalized_expert_bias.pdf"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def _paper_headline_table(window_steps: int = 200_000,
                           aggregation: str = "iqm") -> "pd.DataFrame":
     """Final-score table: one row per env, one column per method.
@@ -4169,11 +4373,14 @@ def _paper_headline_table(window_steps: int = 200_000,
         env_slug = env.lower()
         row = {"env": env, "expert": _PAPER_EXPERT[env]}
         for method, label, _ in _PAPER_METHODS:
-            tb = _paper_best_trial_tb(env_slug, method)
-            if tb is None:
+            sel = _paper_best_trial_tb(env_slug, method)
+            if sel is None:
                 row[label] = float("nan")
                 continue
-            curves = _paper_read_seed_curves(tb, "Eval/episodic_mean_reward")
+            tb, run_ids = sel
+            curves = _paper_read_seed_curves(
+                tb, "Eval/episodic_mean_reward", run_ids=run_ids
+            )
             steps, values = _paper_curves_to_array(curves)
             if values.size == 0:
                 row[label] = float("nan")
@@ -4181,57 +4388,238 @@ def _paper_headline_table(window_steps: int = 200_000,
             last_step = int(steps[-1])
             mask = steps >= max(0, last_step - window_steps)
             window = values[mask]
+            # Per-seed mean over the trailing window, then IQM across
+            # seeds. This matches the run_full_study --status reporting
+            # convention so the headline table and the live status agree.
+            per_seed = window.mean(axis=0)
             if aggregation == "iqm":
-                row[label] = float(_iqm(window).mean())
+                sorted_seeds = np.sort(per_seed)
+                n = len(sorted_seeds)
+                lo, hi = n // 4, (3 * n) // 4
+                row[label] = float(
+                    sorted_seeds[lo:hi].mean() if hi > lo else sorted_seeds.mean()
+                )
             else:
-                row[label] = float(window.mean())
+                row[label] = float(per_seed.mean())
         rows.append(row)
     return pd.DataFrame(rows)
 
 
-def _paper_render_degradation(env: str) -> Optional[Path]:
-    """Degradation curve: x = expert noise σ, y = final score, line per method."""
+def _paper_collect_degradation(
+    env: str,
+    skip_methods: tuple = ("sac",),
+) -> tuple[list[float],
+           list[tuple[str, str, str, dict[float, dict]]]]:
+    """Collect per-(method, sigma) bias stats for degradation plots.
+
+    Returns ``(sigmas, [(method, label, color, {sigma: stats})...])``
+    where ``stats`` is ``{"iqm": float, "q1": float, "q3": float,
+    "n_seeds": int, "has_dist": bool}``. ``q1``/``q3`` equal ``iqm``
+    when per-seed data is unavailable (legacy JSONs).
+    Always includes σ=0 (clean expert) anchored to the HPO best trial.
+    """
     env_slug = env.lower()
     sigmas = sorted({
         float(p.stem.split("__sigma")[-1])
         for p in _PAPER_DEG_DIR.glob(f"{env_slug}__*__sigma*.json")
     })
-    if not sigmas:
-        return None
-    fig, ax = plt.subplots(figsize=(7.5, 5))
-    plotted = False
+    expert = _PAPER_EXPERT.get(env)
+
+    def _stats_from_seeds(per_seed: np.ndarray, expert_val: float) -> dict:
+        bias = per_seed - expert_val
+        bias_sorted = np.sort(bias)
+        n = len(bias_sorted)
+        lo, hi = n // 4, (3 * n) // 4
+        iqm = (float(bias_sorted[lo:hi].mean())
+               if hi > lo else float(bias_sorted.mean()))
+        q1, q3 = (np.percentile(bias, [25.0, 75.0]) if n >= 2
+                  else (iqm, iqm))
+        return {"iqm": iqm, "q1": float(q1), "q3": float(q3),
+                "n_seeds": int(n), "has_dist": n >= 2}
+
+    rows: list[tuple[str, str, str, dict[float, dict]]] = []
     for method, label, color in _PAPER_METHODS:
-        ys = []
-        xs = []
+        if method in skip_methods:
+            continue
+        per_sigma: dict[float, dict] = {}
+        sel = _paper_best_trial_tb(env_slug, method)
+        if sel is not None and expert is not None:
+            tb, run_ids = sel
+            curves = _paper_read_seed_curves(
+                tb, "Eval/episodic_mean_reward", run_ids=run_ids,
+            )
+            steps, values = _paper_curves_to_array(curves)
+            if values.size:
+                last_step = int(steps[-1])
+                mask = steps >= max(0, last_step - 200_000)
+                window = values[mask]
+                per_seed = window.mean(axis=0)
+                per_sigma[0.0] = _stats_from_seeds(per_seed, expert)
         for sigma in sigmas:
             f = _PAPER_DEG_DIR / f"{env_slug}__{method}__sigma{sigma}.json"
             if not f.exists():
                 continue
             with open(f) as fh:
                 payload = json.load(fh)
+            if expert is None:
+                continue
+            ps = payload.get("per_seed_metric")
+            if ps:
+                arr = np.asarray(
+                    [v for v in ps if v is not None], dtype=np.float32,
+                )
+                if arr.size >= 2:
+                    per_sigma[float(sigma)] = _stats_from_seeds(arr, expert)
+                    continue
             metric = payload.get("final_metric") or payload.get("best_hpo_score")
             if metric is None:
                 continue
-            xs.append(sigma)
-            ys.append(float(metric))
-        if not xs:
-            continue
-        ax.plot(xs, ys, "o-", color=color, lw=2, label=label)
-        plotted = True
-    if not plotted:
-        plt.close(fig)
+            iqm = float(metric) - expert
+            per_sigma[float(sigma)] = {
+                "iqm": iqm, "q1": iqm, "q3": iqm, "n_seeds": 0,
+                "has_dist": False,
+            }
+        if per_sigma:
+            rows.append((method, label, color, per_sigma))
+    all_sigmas = sorted({0.0, *sigmas})
+    return all_sigmas, rows
+
+
+def _paper_render_degradation(
+    env: str,
+    skip_methods: tuple = ("sac",),
+) -> Optional[Path]:
+    """Degradation curve: IQM line + Q1-Q3 fill band per method.
+
+    Style matches the legacy ``plot_degradation_curve`` look: thick
+    coloured lines with circle markers, translucent IQR shading, dashed
+    y-grid, hidden top/right spines, framed legend. σ=0 is anchored to
+    the clean-expert phase3 best trial.
+    """
+    _paper_apply_legacy_style()
+    sigmas, rows = _paper_collect_degradation(env, skip_methods=skip_methods)
+    if not rows:
         return None
-    expert = _PAPER_EXPERT.get(env)
-    if expert is not None:
-        ax.axhline(expert, color="tab:red", ls=":", lw=1.0,
-                   label=f"expert = {expert:.0f}")
-    ax.set_xlabel("expert action noise σ")
-    ax.set_ylabel("final eval reward")
-    ax.set_title(f"{env} — degradation under noisy expert")
-    ax.grid(alpha=0.3)
-    ax.legend(loc="lower left", fontsize=9, frameon=False)
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    for method, label, color, per_sigma in rows:
+        xs = sorted(per_sigma.keys())
+        ys = np.asarray([per_sigma[s]["iqm"] for s in xs])
+        q1 = np.asarray([per_sigma[s]["q1"] for s in xs])
+        q3 = np.asarray([per_sigma[s]["q3"] for s in xs])
+        is_proposed = method == "sac_quality_aware"
+        ax.plot(
+            xs, ys, color=color,
+            linewidth=2.2 if is_proposed else 1.6,
+            marker="o", markersize=6 if is_proposed else 4,
+            markeredgecolor="white", markeredgewidth=0.8,
+            label=label, zorder=4 if is_proposed else 3,
+        )
+        ax.fill_between(
+            xs, q1, q3, color=color,
+            alpha=0.18 if is_proposed else 0.12,
+            linewidth=0, zorder=2 if is_proposed else 1,
+        )
+    ax.axhline(0.0, color="#777777", linewidth=1.0, linestyle="-",
+               alpha=0.6, zorder=1)
+    ax.set_xlabel("Expert action noise $\\sigma$")
+    ax.set_ylabel("Expert bias $\\Delta = J_\\pi - J_{\\mathrm{exp}}$")
+    ax.set_title(env)
+    ax.grid(axis="y")
+    ax.set_axisbelow(True)
+    ax.legend(loc="best")
     _PAPER_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = _PAPER_OUT_DIR / f"degradation_{env_slug}.pdf"
+    out_path = _PAPER_OUT_DIR / f"degradation_{env.lower()}.pdf"
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _paper_render_degradation_bars(
+    env: str,
+    skip_methods: tuple = ("sac",),
+) -> Optional[Path]:
+    """Degradation as grouped bars: one group per σ, one bar per method.
+
+    Standard height-from-zero bars showing the IQM bias. Style matches
+    the legacy degradation plot: framed legend, dashed y-grid, hidden
+    top/right spines, DeepMind palette.
+    """
+    _paper_apply_legacy_style()
+    sigmas, rows = _paper_collect_degradation(env, skip_methods=skip_methods)
+    if not rows:
+        return None
+    n_groups = len(sigmas)
+    n_methods = len(rows)
+    group_w = 0.84
+    bar_w = group_w / max(n_methods, 1)
+    fig, ax = plt.subplots(figsize=(7.3, 4.4))
+    x = np.arange(n_groups, dtype=np.float32)
+    pct_labels: list[tuple[float, float, str, bool]] = []
+    for i, (method, label, color, per_sigma) in enumerate(rows):
+        is_proposed = method == "sac_quality_aware"
+        offsets = x - group_w / 2 + bar_w / 2 + i * bar_w
+        heights = np.array(
+            [per_sigma[s]["iqm"] if s in per_sigma else np.nan
+             for s in sigmas],
+            dtype=np.float32,
+        )
+        mask = np.isfinite(heights)
+        ax.bar(
+            offsets[mask], heights[mask], width=bar_w * 0.86,
+            color=color, alpha=0.95 if is_proposed else 0.78,
+            edgecolor="#222222" if is_proposed else color,
+            linewidth=1.0 if is_proposed else 0.6,
+            label=label, zorder=3 if is_proposed else 2,
+        )
+        # Per-bar relative-degradation labels: percentage change in
+        # bias relative to this method's σ=0 reference. Skip the σ=0
+        # group itself (it is the reference). Use |ref| as denominator
+        # so the sign of the change stays interpretable when the
+        # reference is negative (e.g. residual SAC).
+        ref = per_sigma.get(0.0, {}).get("iqm")
+        if ref is None or not np.isfinite(ref) or abs(ref) < 1e-6:
+            continue
+        for xi, sigma in enumerate(sigmas):
+            if sigma == 0.0 or sigma not in per_sigma:
+                continue
+            h = per_sigma[sigma]["iqm"]
+            pct = (h - ref) / abs(ref) * 100.0
+            sign = "+" if pct >= 0 else "−"
+            pct_labels.append(
+                (offsets[xi], h, f"{sign}{abs(pct):.0f}%", is_proposed)
+            )
+    ax.axhline(0.0, color="#777777", linewidth=1.0, linestyle="-",
+               alpha=0.6, zorder=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels([f"$\\sigma={s:g}$" for s in sigmas])
+    ax.set_xlabel("Expert action noise")
+    ax.set_ylabel("Expert bias $\\Delta = J_\\pi - J_{\\mathrm{exp}}$")
+    ax.set_title(env)
+    ax.grid(axis="y")
+    ax.set_axisbelow(True)
+    ax.legend(loc="best", ncol=2)
+    # Pad y-limits a touch so percentage annotations don't collide
+    # with axis edges, then draw labels above (below) positive
+    # (negative) bars.
+    if pct_labels:
+        y_lo, y_hi = ax.get_ylim()
+        span = y_hi - y_lo
+        ax.set_ylim(y_lo - 0.04 * span, y_hi + 0.06 * span)
+        offset = 0.012 * (y_hi - y_lo)
+        for xpos, h, text, is_prop in pct_labels:
+            above = h >= 0
+            y = h + offset if above else h - offset
+            ax.annotate(
+                text, xy=(xpos, y),
+                ha="center", va="bottom" if above else "top",
+                fontsize=7.5,
+                fontweight="bold" if is_prop else "regular",
+                color="#222222",
+                zorder=5,
+            )
+    _PAPER_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = _PAPER_OUT_DIR / f"degradation_bars_{env.lower()}.pdf"
     plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -4243,9 +4631,12 @@ def _paper_render_ablation_bar(env: str) -> Optional[Path]:
     env_slug = env.lower()
     rows = []
     # Reference: edge-qa final score on this env (no ablation).
-    qa_tb = _paper_best_trial_tb(env_slug, "sac_quality_aware")
-    if qa_tb is not None:
-        curves = _paper_read_seed_curves(qa_tb, "Eval/episodic_mean_reward")
+    qa_sel = _paper_best_trial_tb(env_slug, "sac_quality_aware")
+    if qa_sel is not None:
+        qa_tb, qa_run_ids = qa_sel
+        curves = _paper_read_seed_curves(
+            qa_tb, "Eval/episodic_mean_reward", run_ids=qa_run_ids,
+        )
         steps, values = _paper_curves_to_array(curves)
         if values.size:
             last_step = int(steps[-1])
@@ -4287,11 +4678,90 @@ def _paper_render_ablation_bar(env: str) -> Optional[Path]:
     return out_path
 
 
-def make_paper_figures(envs: Optional[list[str]] = None) -> list[Path]:
+def _paper_placeholder_pdf(path: Path, label: str) -> Path:
+    """Write a small "data pending" PDF at ``path``.
+
+    Used by ``make_paper_figures(with_placeholders=True)`` so the
+    paper LaTeX build succeeds even when the corresponding experiment
+    has not yet produced data; reviewers see an explicit placeholder
+    instead of a missing-figure compile error.
+    """
+    _paper_apply_style()
+    fig, ax = plt.subplots(figsize=(6.0, 3.6))
+    ax.axis("off")
+    # Soft gray rectangle so it's visually obviously a placeholder.
+    ax.add_patch(plt.Rectangle(
+        (0.02, 0.05), 0.96, 0.90, transform=ax.transAxes,
+        facecolor="#f4f4f4", edgecolor="#bbbbbb",
+        linewidth=1.0, linestyle="--", zorder=0,
+    ))
+    ax.text(
+        0.5, 0.62, "data pending",
+        transform=ax.transAxes,
+        ha="center", va="center",
+        fontsize=18, color="#555555", fontweight="semibold",
+    )
+    ax.text(
+        0.5, 0.42, label,
+        transform=ax.transAxes,
+        ha="center", va="center",
+        fontsize=11, color="#777777",
+    )
+    ax.text(
+        0.5, 0.18,
+        "regenerated by \\texttt{make plot} once results land",
+        transform=ax.transAxes, ha="center", va="center",
+        fontsize=9, color="#999999",
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return path
+
+
+def _paper_expected_figs(envs: list[str]) -> list[tuple[Path, str]]:
+    """Canonical list of (path, human-label) for every figure the paper
+    expects, given a list of envs.
+
+    Keep this in sync with the ``\\includegraphics`` calls in
+    ``paper/paper.tex``. Used by the placeholder backfill so missing
+    files get a "data pending" stub instead of breaking the LaTeX
+    build.
+    """
+    figs: list[tuple[Path, str]] = []
+    for env in envs:
+        slug = env.lower()
+        figs.append((_PAPER_OUT_DIR / f"curves_{slug}_Eval_episodic_mean_reward.pdf",
+                     f"{env}: training curves (episodic return)"))
+        figs.append((_PAPER_OUT_DIR / f"curves_{slug}_Eval_expert_bias.pdf",
+                     f"{env}: expert-bias trajectories"))
+        figs.append((_PAPER_OUT_DIR / f"degradation_{slug}.pdf",
+                     f"{env}: degradation curves"))
+        figs.append((_PAPER_OUT_DIR / f"degradation_bars_{slug}.pdf",
+                     f"{env}: degradation grouped bars"))
+        # Per-env rliable / sample-efficiency figures.
+        figs.append((_PAPER_OUT_DIR / f"aggregated_rliable_{slug}.pdf",
+                     f"{env}: rliable IQM + IQR (per-env)"))
+        figs.append((_PAPER_OUT_DIR / f"sample_efficiency_sweep_{slug}.pdf",
+                     f"{env}: sample efficiency at three thresholds (per-env)"))
+    figs.append((_PAPER_OUT_DIR / "aggregated_rliable.pdf",
+                 "Aggregated rliable figure (cross-env)"))
+    figs.append((_PAPER_OUT_DIR / "sample_efficiency_sweep.pdf",
+                 "Sample-efficiency sweep (cross-env)"))
+    return figs
+
+
+def make_paper_figures(envs: Optional[list[str]] = None,
+                       with_placeholders: bool = False) -> list[Path]:
     """Generate all paper figures into ``paper/figs/``.
 
-    Returns the list of files written. Safe to call repeatedly; only the
-    files whose data is currently on disk are produced.
+    Returns the list of files written. Safe to call repeatedly; only
+    the files whose data is currently on disk are produced.
+
+    ``with_placeholders=True`` (used by ``make plot``) backfills any
+    figure whose render returned ``None`` or raised, with a "data
+    pending" PDF so the paper LaTeX build does not break on missing
+    files.
     """
     if envs is None:
         envs = list(_PAPER_EXPERT.keys())
@@ -4300,7 +4770,9 @@ def make_paper_figures(envs: Optional[list[str]] = None) -> list[Path]:
         for fn in (
             _paper_render_curves,
             _paper_render_bias,
+            _paper_render_norm_bias,
             _paper_render_degradation,
+            _paper_render_degradation_bars,
             _paper_render_ablation_bar,
         ):
             try:
@@ -4320,6 +4792,44 @@ def make_paper_figures(envs: Optional[list[str]] = None) -> list[Path]:
         print(f"  wrote {csv_path}")
     except Exception as e:
         print(f"  [headline_table] failed: {e!r}")
+    if with_placeholders:
+        # Two-pass aggregated/sweep render so the canonical figure list
+        # below sees the latest state of the pipeline before placeholder
+        # backfill (callers that take the `--paper` path also call these
+        # at the end; we duplicate the call here so a single
+        # ``make plot`` invocation is sufficient). Both the cross-env
+        # (env=None) and per-env variants are produced.
+        for fn in (_paper_render_aggregated,
+                   _paper_render_sample_efficiency_sweep):
+            try:
+                p = fn()  # cross-env aggregate
+                if p is not None:
+                    written.append(p)
+                    print(f"  wrote {p}")
+            except Exception as e:
+                print(f"  [{fn.__name__}] failed: {e!r}")
+            for env in envs:
+                try:
+                    p = fn(env=env)
+                    if p is not None:
+                        written.append(p)
+                        print(f"  wrote {p}")
+                except Exception as e:
+                    print(f"  [{fn.__name__}/{env}] failed: {e!r}")
+        # Backfill any expected figure NOT freshly rendered in this
+        # invocation with a placeholder. We compare against the set of
+        # paths just written, not against ``path.exists()``: a stale
+        # PDF from an earlier run with different data on disk would
+        # otherwise survive here even though its data is now missing,
+        # silently misrepresenting the current study state in the
+        # paper. Always overwriting on placeholder is the safe choice.
+        rendered = {Path(p).resolve() for p in written}
+        for path, label in _paper_expected_figs(envs):
+            if path.resolve() in rendered:
+                continue
+            _paper_placeholder_pdf(path, label)
+            written.append(path)
+            print(f"  placeholder {path}")
     return written
 
 
@@ -4335,10 +4845,13 @@ def _paper_per_seed_final(env: str, method: str,
     Equivalent to: each seed's final-score sample for the asymptotic
     metric. Returns None if data missing.
     """
-    tb = _paper_best_trial_tb(env.lower(), method)
-    if tb is None:
+    sel = _paper_best_trial_tb(env.lower(), method)
+    if sel is None:
         return None
-    curves = _paper_read_seed_curves(tb, "Eval/episodic_mean_reward")
+    tb, run_ids = sel
+    curves = _paper_read_seed_curves(
+        tb, "Eval/episodic_mean_reward", run_ids=run_ids,
+    )
     steps, values = _paper_curves_to_array(curves)
     if values.size == 0:
         return None
@@ -4350,26 +4863,35 @@ def _paper_per_seed_final(env: str, method: str,
 def _paper_per_seed_sample_eff(env: str, method: str,
                                bias_frac: float = 0.0,
                                ) -> Optional[np.ndarray]:
-    """Per-seed sample-efficiency score in [0, 1].
+    """Per-seed sample-efficiency score (lower is faster), in [0, 1].
 
     Uses ``Eval/expert_bias`` (= policy return − expert return). For each
     seed: first step at which the lightly-smoothed bias permanently
     exceeds ``bias_frac * expert`` (i.e. the policy is at least
     ``bias_frac × J_exp`` above the expert and never falls back below).
-    Score = 1 - (step / max_step). Seeds that never cross get score 0.
+    Score = ``step_at_cross / max_step``. Seeds that never cross get
+    score 1.0 (full training budget consumed without crossing).
 
     ``bias_frac=0.0`` ⇒ steps-to-expert-parity (the headline metric).
     Larger fractions correspond to "steps to beat expert by X% of its
     own return"; the appendix figure uses 0.25 / 0.5 sweeps.
+
+    Direction note: this metric is "fraction of training budget required
+    to reach the bar", so LOWER is better. The aggregated-figure code
+    inverts it for visual consistency with the other panels (where
+    higher = better) by computing IQM on (1 − this).
     """
     expert = _PAPER_EXPERT.get(env)
     if expert is None:
         return None
     threshold = bias_frac * expert
-    tb = _paper_best_trial_tb(env.lower(), method)
-    if tb is None:
+    sel = _paper_best_trial_tb(env.lower(), method)
+    if sel is None:
         return None
-    curves = _paper_read_seed_curves(tb, "Eval/expert_bias")
+    tb, run_ids = sel
+    curves = _paper_read_seed_curves(
+        tb, "Eval/expert_bias", run_ids=run_ids,
+    )
     steps, values = _paper_curves_to_array(curves)
     if values.size == 0:
         return None
@@ -4385,16 +4907,15 @@ def _paper_per_seed_sample_eff(env: str, method: str,
     out = np.zeros(n_seeds, dtype=np.float32)
     for k in range(n_seeds):
         # Permanent crossing: from index i onward, all values stay above
-        # threshold. Equivalent to "smallest i s.t. min(smoothed[i:]) >=
-        # threshold".
+        # threshold.
         col = smoothed[:, k]
         suffix_min = np.minimum.accumulate(col[::-1])[::-1]
         idx = np.where(suffix_min >= threshold)[0]
         if idx.size == 0:
-            out[k] = 0.0
+            out[k] = 1.0  # never crossed = full budget consumed
         else:
             step_at_cross = int(steps[idx[0]])
-            out[k] = max(0.0, 1.0 - step_at_cross / max(1, max_step))
+            out[k] = min(1.0, step_at_cross / max(1, max_step))
     return out
 
 
@@ -4442,22 +4963,29 @@ def _paper_per_seed_degradation(env: str, method: str,
     arr = arr[order]
     sigmas_sorted = np.asarray(sigmas, dtype=np.float32)[order]
     # Trapezoid AUC over sigma, normalised by sigma range and expert score.
-    auc = np.trapz(arr, x=sigmas_sorted, axis=0)
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
+    auc = _trapz(arr, x=sigmas_sorted, axis=0)
     sigma_span = max(1e-8, sigmas_sorted[-1] - sigmas_sorted[0])
     return auc / (sigma_span * expert)
 
 
 def _paper_collect(metric_fn, methods: list[str],
+                   envs: Optional[list[str]] = None,
                    ) -> dict[str, dict[str, np.ndarray]]:
     """Build {env: {method: per_seed_normalised_score}} for the given metric_fn.
 
     Asymptotic scores get expert-normalised here (others come pre-normalised).
+    ``envs`` restricts the aggregation to a subset (used by the per-env
+    aggregated / sample-eff figures); defaults to all paper envs.
     """
     out: dict[str, dict[str, np.ndarray]] = {}
     is_final = metric_fn is _paper_per_seed_final
-    for env in _PAPER_EXPERT:
+    target_envs = envs if envs is not None else list(_PAPER_EXPERT.keys())
+    for env in target_envs:
         env_d: dict[str, np.ndarray] = {}
-        expert = _PAPER_EXPERT[env]
+        expert = _PAPER_EXPERT.get(env)
+        if expert is None:
+            continue
         for m in methods:
             arr = metric_fn(env, m)
             if arr is None or arr.size == 0:
@@ -4512,11 +5040,14 @@ def _prob_of_improvement(
     method: str, baseline: str,
     n_boot: int = 2000,
     rng: np.random.Generator | None = None,
+    lower_better: bool = False,
 ) -> tuple[float, float, float]:
-    """P(method > baseline) averaged across envs (Mann-Whitney style).
+    """P(method beats baseline) averaged across envs (Mann-Whitney style).
 
-    For each env, P_env = mean over (i,j) of 1[X_i > Y_j] + 0.5*1[==].
-    Final = mean across envs. CI via stratified bootstrap over seeds.
+    For each env, P_env = mean over (i,j) of 1[method_i better than baseline_j]
+    + 0.5*1[==]. Final = mean across envs. CI via stratified bootstrap
+    over seeds. ``lower_better=True`` flips the comparison so the metric
+    can be sample-efficiency (t/T to threshold; lower = faster).
     """
     if rng is None:
         rng = np.random.default_rng(1)
@@ -4528,6 +5059,8 @@ def _prob_of_improvement(
     def _pair_prob(x: np.ndarray, y: np.ndarray) -> float:
         xc = x[:, None]; yc = y[None, :]
         n = xc.shape[0] * yc.shape[1]
+        if lower_better:
+            return float(((xc < yc).sum() + 0.5 * (xc == yc).sum()) / n)
         return float(((xc > yc).sum() + 0.5 * (xc == yc).sum()) / n)
 
     point = float(np.mean([
@@ -4548,166 +5081,111 @@ def _prob_of_improvement(
 
 
 def _paper_apply_style() -> None:
-    """Apply the project's plot style: clean, DeepMind/rliable inspired."""
+    """Project plot style: 'clean modern DeepMind' look.
+
+    Sans-serif font (DejaVu Sans / Helvetica fallback), framed legend,
+    hidden top/right spines, dashed light-gray y-grid. Matches the
+    original plot_sweep.py legacy aesthetic so all paper figures share
+    the same look (curves, ablation, aggregated rliable, sample-eff
+    sweep, degradation lines + bars).
+    """
     plt.rcParams.update({
-        "font.family": "serif",
-        "font.size": 10,
-        "axes.titlesize": 11,
-        "axes.labelsize": 10,
+        "font.family": "sans-serif",
+        "font.sans-serif": ["DejaVu Sans", "Helvetica", "Arial",
+                            "Liberation Sans"],
+        "font.size": 11,
+        "axes.titlesize": 13,
+        "axes.titleweight": "regular",
+        "axes.labelsize": 12,
         "axes.spines.top": False,
         "axes.spines.right": False,
-        "axes.linewidth": 0.8,
-        "axes.edgecolor": "#333333",
-        "xtick.color": "#333333",
-        "ytick.color": "#333333",
+        "axes.linewidth": 0.9,
+        "axes.edgecolor": "#222222",
+        "axes.titlepad": 8.0,
+        "xtick.color": "#222222",
+        "ytick.color": "#222222",
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
         "xtick.major.size": 3,
         "ytick.major.size": 3,
         "xtick.direction": "out",
         "ytick.direction": "out",
-        "legend.frameon": False,
-        "grid.color": "#cccccc",
+        "legend.frameon": True,
+        "legend.framealpha": 0.92,
+        "legend.edgecolor": "#cccccc",
+        "legend.facecolor": "white",
+        "legend.fontsize": 9,
+        "legend.handlelength": 1.6,
+        "legend.borderpad": 0.4,
+        "legend.labelspacing": 0.35,
+        "grid.color": "#d9d9d9",
         "grid.linewidth": 0.6,
-        "grid.alpha": 0.5,
+        "grid.alpha": 0.7,
+        "grid.linestyle": "--",
     })
 
 
-def _paper_render_aggregated(baseline: str = "ibrl") -> Optional[Path]:
-    """rliable-style aggregated figure: per-method IQM with stratified
-    bootstrap CIs (top row) and P(improvement vs the strongest baseline)
-    (bottom row), across the three paper metrics.
+# Backwards-compat alias: existing code still calls the legacy variant.
+_paper_apply_legacy_style = _paper_apply_style
+
+
+def _paper_render_aggregated(baseline: str = "ibrl",
+                             env: Optional[str] = None) -> Optional[Path]:
+    """Aggregated figure: per-method IQM with stratified-bootstrap IQR
+    bar, on the two scalar axes (asymptotic $\\tilde\\Delta$ and
+    robustness AUC).
+
+    Sample efficiency is intentionally NOT a column here: it is shown
+    in its own figure (``sample_efficiency_sweep.pdf``) as a per-
+    threshold breakdown, since a single scalar collapses too much
+    information (early-vs-late crossover, censored seeds, etc.). The
+    P(method $\\succ$ baseline) row is also dropped because it is hard
+    to read and does not add information beyond the IQM bars when the
+    bootstrap CIs already tell the same story.
+
+    ``env=None`` aggregates across all paper envs (the cross-task
+    summary, written to ``aggregated_rliable.pdf``); a specific env
+    restricts to that env only and is written to
+    ``aggregated_rliable_<env>.pdf``.
     """
     _paper_apply_style()
+    envs = [env] if env is not None else None
     proposed = "sac_quality_aware"
     methods = [m for m, _, _ in _PAPER_METHODS]
     metric_fns = [
         ("Asymptotic performance",
-         "expert-normalized return", _paper_per_seed_final),
-        ("Sample efficiency",
-         "1 − step/total to expert parity (bias = 0)",
-         _paper_per_seed_sample_eff),
-        ("Robustness to expert decay",
-         "expert-normalized AUC over σ", _paper_per_seed_degradation),
+         "$\\tilde\\Delta$ (expert-normalized advantage)",
+         _paper_per_seed_final),
+        ("Robustness to expert noise",
+         "expert-normalized AUC over $\\sigma$",
+         _paper_per_seed_degradation),
     ]
 
     fig, axes = plt.subplots(
-        2, 3, figsize=(11.5, 5.5),
-        gridspec_kw={"height_ratios": [1.0, 1.0], "hspace": 0.55,
-                     "wspace": 0.45},
-    )
-    any_data = False
-
-    def _hbar(ax, items, xlim=None, axline=None):
-        """Render rliable-style horizontal interval bars.
-
-        Each entry draws a bar spanning [Q1, Q3] of the bootstrap
-        distribution, with a contrasting vertical tick at the point
-        estimate (IQM). Items: ``(label, point, q1, q3, color,
-        is_proposed)``.
-        """
-        n = len(items)
-        y = np.arange(n)
-        bar_height = 0.55
-        for i, (label, pt, q1, q3, color, is_prop) in enumerate(items):
-            width = max(q3 - q1, 1e-6)
-            ax.barh(i, width, left=q1, height=bar_height,
-                    color=color, alpha=0.95 if is_prop else 0.6,
-                    edgecolor=color, linewidth=1.4 if is_prop else 0.8)
-            # Vertical tick at the point estimate (IQM).
-            ax.vlines(pt, i - bar_height / 2, i + bar_height / 2,
-                      colors="#111111",
-                      linewidth=2.0 if is_prop else 1.4)
-        ax.set_yticks(y)
-        ax.set_yticklabels(
-            [("$\\mathbf{"+l+"}$" if is_p else l)
-             for (l, _, _, _, _, is_p) in items],
-            fontsize=9,
-        )
-        ax.invert_yaxis()
-        ax.tick_params(axis="y", length=0)
-        ax.grid(axis="x", which="major")
-        if axline is not None:
-            ax.axvline(axline, color="#444444", ls="--", lw=0.9, alpha=0.7)
-        if xlim is not None:
-            ax.set_xlim(*xlim)
-
-    for col, (title, xlabel, fn) in enumerate(metric_fns):
-        data = _paper_collect(fn, methods)
-        if not data:
-            for row in (0, 1):
-                axes[row, col].set_axis_off()
-            continue
-        any_data = True
-
-        # Top row: IQM with bootstrap IQR.
-        items = []
-        for m, label, color in _PAPER_METHODS:
-            pe, q1, q3 = _stratified_bootstrap_iqm(data, m)
-            if not np.isnan(pe):
-                items.append((label, pe, q1, q3, color, m == proposed))
-        ax = axes[0, col]
-        _hbar(ax, items)
-        ax.set_title(title, fontsize=11, pad=6)
-        ax.set_xlabel(xlabel, fontsize=9)
-
-        # Bottom row: P(improvement vs baseline)
-        items2 = []
-        for m, label, color in _PAPER_METHODS:
-            if m == baseline:
-                continue
-            p, q1, q3 = _prob_of_improvement(data, m, baseline)
-            if not np.isnan(p):
-                items2.append((label, p, q1, q3, color, m == proposed))
-        ax2 = axes[1, col]
-        _hbar(ax2, items2, xlim=(0, 1), axline=0.5)
-        ax2.set_xlabel(f"P(method $\\succ$ {baseline.upper()})", fontsize=9)
-
-    if not any_data:
-        plt.close(fig)
-        return None
-    axes[0, 0].annotate("IQM (stratified bootstrap, IQR bar)",
-                        xy=(-0.55, 0.5), xycoords="axes fraction",
-                        rotation=90, ha="center", va="center",
-                        fontsize=10, color="#333333")
-    axes[1, 0].annotate(f"vs.\\ {baseline.upper()}",
-                        xy=(-0.55, 0.5), xycoords="axes fraction",
-                        rotation=90, ha="center", va="center",
-                        fontsize=10, color="#333333")
-    fig.suptitle("Aggregated across the 5 benchmark tasks",
-                 fontsize=12, y=1.02)
-    _PAPER_OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = _PAPER_OUT_DIR / "aggregated_rliable.pdf"
-    plt.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-def _paper_render_sample_efficiency_sweep() -> Optional[Path]:
-    """Appendix figure: sample-efficiency IQM bars at three normalized
-    bias thresholds (0%, 25%, 50% of J_exp). Tests whether EDGE's
-    sample-efficiency lead survives raising the bar past mere parity.
-    """
-    _paper_apply_style()
-    proposed = "sac_quality_aware"
-    methods = [m for m, _, _ in _PAPER_METHODS]
-    thresholds = [0.0, 0.25, 0.5]
-    fig, axes = plt.subplots(
-        1, 3, figsize=(11.5, 3.0),
-        gridspec_kw={"wspace": 0.45},
+        1, 2, figsize=(10.0, 3.4),
+        gridspec_kw={"wspace": 0.40},
     )
     any_data = False
 
     def _hbar(ax, items):
+        """Render the IQM (vertical tick) + IQR (translucent rectangle)
+        per method. Matches the legacy plot_expert_bias_summary style.
+        """
         n = len(items)
         y = np.arange(n)
-        bar_height = 0.55
+        bar_h = 0.34
+        iqm_lw = 2.6
         for i, (label, pt, q1, q3, color, is_prop) in enumerate(items):
-            width = max(q3 - q1, 1e-6)
-            ax.barh(i, width, left=q1, height=bar_height,
-                    color=color, alpha=0.95 if is_prop else 0.6,
-                    edgecolor=color, linewidth=1.4 if is_prop else 0.8)
-            ax.vlines(pt, i - bar_height / 2, i + bar_height / 2,
-                      colors="#111111",
-                      linewidth=2.0 if is_prop else 1.4)
+            ax.fill_betweenx(
+                [i - bar_h, i + bar_h], q1, q3,
+                color=color, alpha=0.35 if is_prop else 0.20,
+                linewidth=0,
+            )
+            for x in (q1, q3):
+                ax.plot([x, x], [i - bar_h, i + bar_h],
+                        color=color, linewidth=1.0, alpha=0.7)
+            ax.plot([pt, pt], [i - bar_h, i + bar_h],
+                    color=color, linewidth=iqm_lw, solid_capstyle="butt")
         ax.set_yticks(y)
         ax.set_yticklabels(
             [("$\\mathbf{"+l+"}$" if is_p else l)
@@ -4716,11 +5194,11 @@ def _paper_render_sample_efficiency_sweep() -> Optional[Path]:
         )
         ax.invert_yaxis()
         ax.tick_params(axis="y", length=0)
-        ax.grid(axis="x", which="major")
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.grid(axis="x", linestyle="--", linewidth=0.5, alpha=0.5)
 
-    for col, frac in enumerate(thresholds):
-        fn = _paper_per_seed_sample_eff_at(frac)
-        data = _paper_collect(fn, methods)
+    for col, (title, xlabel, fn) in enumerate(metric_fns):
+        data = _paper_collect(fn, methods, envs=envs)
         if not data:
             axes[col].set_axis_off()
             continue
@@ -4732,15 +5210,134 @@ def _paper_render_sample_efficiency_sweep() -> Optional[Path]:
                 items.append((label, pe, q1, q3, color, m == proposed))
         ax = axes[col]
         _hbar(ax, items)
-        ax.set_title(f"bias $\\geq$ {int(frac * 100)}\\% of $J_{{\\mathrm{{exp}}}}$",
-                     fontsize=10, pad=4)
-        ax.set_xlabel("1 − step/total (higher = faster)", fontsize=9)
+        ax.set_title(title, fontsize=11, pad=6)
+        ax.set_xlabel(xlabel, fontsize=10)
+
     if not any_data:
         plt.close(fig)
         return None
-    fig.suptitle("Sample efficiency at three bias thresholds (aggregated)",
-                 fontsize=11, y=1.05)
-    out_path = _PAPER_OUT_DIR / "sample_efficiency_sweep.pdf"
+    suptitle = (f"{env}: per-method bootstrap IQM"
+                if env is not None
+                else "Aggregated across the benchmark tasks")
+    fig.suptitle(suptitle, fontsize=12, y=1.04)
+    _PAPER_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    fname = (f"aggregated_rliable_{env.lower()}.pdf"
+             if env is not None else "aggregated_rliable.pdf")
+    out_path = _PAPER_OUT_DIR / fname
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _paper_render_sample_efficiency_sweep(env: Optional[str] = None
+                                          ) -> Optional[Path]:
+    """Sample efficiency: per-method horizontal IQM bar with bootstrap
+    CI, three threshold panels at $\\nbias\\in\\{0, 0.25, 0.5\\}$.
+    Layout matches the legacy ``plot_expert_bias_summary`` style from
+    plot_sweep.py: one row per method, IQM as a thick vertical tick
+    inside a translucent CI rectangle, lower-is-faster x-axis.
+    Methods that never cross the threshold (SAC, Residual) are dropped
+    so the panel only shows methods with measurable times-to-cross.
+
+    ``env=None`` aggregates across all paper envs (cross-task figure,
+    written to ``sample_efficiency_sweep.pdf``); a specific env
+    restricts to that env only and is written to
+    ``sample_efficiency_sweep_<env>.pdf``.
+    """
+    _paper_apply_style()
+    envs = [env] if env is not None else None
+    proposed = "sac_quality_aware"
+    # Drop methods that don't cross expert parity on any task: SAC and
+    # Residual SAC stay below $\nbias=0$ on Plane3DCircle, so their
+    # crossing time is censored at $T+1$ for every seed and the
+    # bootstrap interval collapses to a single edge value.
+    skip = {"sac", "residual"}
+    methods_kept = [(m, lab, c) for m, lab, c in _PAPER_METHODS
+                    if m not in skip]
+    method_names = [m for m, _, _ in methods_kept]
+    thresholds = [0.0, 0.25, 0.5]
+    fig, axes = plt.subplots(
+        1, 3, figsize=(11.5, 3.4),
+        gridspec_kw={"wspace": 0.35},
+    )
+    any_data = False
+
+    bar_h = 0.34
+    iqm_lw = 2.6
+
+    def _draw_row(ax, yi, center, lo, hi, color, is_prop):
+        """Translucent CI rectangle + vertical tick at IQM (legacy
+        plot_expert_bias_summary aesthetic)."""
+        ax.fill_betweenx(
+            [yi - bar_h, yi + bar_h], lo, hi,
+            color=color, alpha=0.35 if is_prop else 0.20,
+            linewidth=0,
+        )
+        for x in (lo, hi):
+            ax.plot([x, x], [yi - bar_h, yi + bar_h],
+                    color=color, linewidth=1.0, alpha=0.7)
+        ax.plot([center, center], [yi - bar_h, yi + bar_h],
+                color=color, linewidth=iqm_lw,
+                solid_capstyle="butt")
+
+    for col, frac in enumerate(thresholds):
+        ax = axes[col]
+        fn = _paper_per_seed_sample_eff_at(frac)
+        data = _paper_collect(fn, method_names, envs=envs)
+        if not data:
+            ax.set_axis_off()
+            continue
+        any_data = True
+        # Collect per-method (center, q1, q3) and skip methods with no
+        # data at this threshold.
+        rows = []
+        for m, label, color in methods_kept:
+            pe, q1, q3 = _stratified_bootstrap_iqm(data, m)
+            if np.isnan(pe):
+                continue
+            rows.append((m, label, color, pe, q1, q3))
+        if not rows:
+            ax.set_axis_off()
+            continue
+        for yi, (m, label, color, pe, q1, q3) in enumerate(rows):
+            _draw_row(ax, yi, pe, q1, q3, color, m == proposed)
+        ax.set_yticks(range(len(rows)))
+        ax.set_yticklabels(
+            [("$\\mathbf{"+lab+"}$" if m == proposed else lab)
+             for (m, lab, _, _, _, _) in rows],
+            fontsize=9,
+        )
+        ax.invert_yaxis()
+        ax.tick_params(axis="y", length=0)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.grid(axis="x", linestyle="--", linewidth=0.5, alpha=0.5)
+        ax.set_title(
+            f"$\\tilde\\Delta\\geq{frac:g}$",
+            fontsize=11, pad=4,
+        )
+        ax.set_xlabel("$t/T$ to threshold (lower is faster)", fontsize=10)
+        # Auto-scale: forcing $[0,1]$ dwarfs the differences between
+        # methods that cross within the first ~20% of training.
+        all_lo = min(q1 for *_, q1, _ in rows)
+        all_hi = max(q3 for *_, _, q3 in rows)
+        pad = (all_hi - all_lo) * 0.10 or max(all_hi, 1e-3) * 0.05
+        ax.set_xlim(max(0.0, all_lo - pad), min(1.0, all_hi + pad))
+    if not any_data:
+        plt.close(fig)
+        return None
+    suptitle_prefix = (f"{env}: " if env is not None else "")
+    fig.suptitle(
+        suptitle_prefix
+        + "sample efficiency: per-method IQM (vertical tick) and "
+        "stratified-bootstrap 95\\% CI of normalized first-permanent-"
+        "crossing time, at three $\\tilde\\Delta$ thresholds.",
+        fontsize=10, y=1.04,
+    )
+    fname = (f"sample_efficiency_sweep_{env.lower()}.pdf"
+             if env is not None else "sample_efficiency_sweep.pdf")
+    out_path = _PAPER_OUT_DIR / fname
+    plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out_path
@@ -4757,8 +5354,14 @@ if __name__ == "__main__":
             i = sys.argv.index("--env")
             envs = [sys.argv[i + 1]]
             del sys.argv[i:i + 2]
-        make_paper_figures(envs)
-        if "--aggregated" not in sys.argv:
+        with_placeholders = False
+        if "--with-placeholders" in sys.argv:
+            sys.argv.remove("--with-placeholders")
+            with_placeholders = True
+        make_paper_figures(envs, with_placeholders=with_placeholders)
+        if "--aggregated" not in sys.argv and not with_placeholders:
+            # When with_placeholders, make_paper_figures already runs
+            # the aggregated + sample_eff_sweep renders.
             for label, fn in (("aggregated", _paper_render_aggregated),
                               ("sample_eff_sweep",
                                _paper_render_sample_efficiency_sweep)):
