@@ -11,10 +11,9 @@ values calibrated against per-dim std (e.g. {0.05, 0.15, 0.30}) become
 roughly comparable across envs with very different obs scales.
 
 Mujoco Playground envs (CheetahRun, BarkourJoystick) use a different
-env API (no ``env_params`` arg, env_state object instead of (obs, state)
-tuple). They are skipped here; the worker's ``_load_obs_std`` falls back
-to scalar ``1.0`` for them, in which case sigma is interpreted as
-absolute Gaussian std on raw obs and may need per-env retuning.
+env API (no ``env_params`` arg, single env_state with .obs/.reward)
+than target_gym; both branches are handled here. The worker's
+``_load_obs_std`` reads the same ``obs_std/<env>.npy`` files for both.
 
 Usage::
 
@@ -36,15 +35,18 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 ROOT = Path(__file__).resolve().parent
 OBS_STD_DIR = ROOT / "obs_std"
 
-# Default target_gym envs in the v2 study. Excludes Mujoco Playground
-# (CheetahRun, BarkourJoystick) which use a different env API; those use
-# the scalar 1.0 fallback in the worker.
 DEFAULT_TARGET_GYM_ENVS = [
     "Plane3DCircle",
     "Plane3DFigureEight",
     "FourTank",
     "GlassFurnace",
 ]
+# Mujoco Playground envs in the v2 study. Different env API (handled below).
+DEFAULT_PLAYGROUND_ENVS = [
+    "CheetahRun",
+    "BarkourJoystick",
+]
+DEFAULT_ENVS = DEFAULT_TARGET_GYM_ENVS + DEFAULT_PLAYGROUND_ENVS
 
 
 def rollout_obs(env, env_params, expert, n_steps: int, seed: int = 0):
@@ -92,6 +94,36 @@ def rollout_obs(env, env_params, expert, n_steps: int, seed: int = 0):
     return jnp.concatenate([obs0[None], obs_seq], axis=0)
 
 
+def rollout_obs_playground(env, expert, n_steps: int, seed: int = 0):
+    """Mujoco Playground rollout: env_state-based, no env_params arg.
+
+    The Ajax wrapper stack (BatchRngWrapper / VmapWrapper / ...) returns an
+    env with .reset(key) -> State and .step(state, action) -> State, where
+    the State carries .obs of shape (n_envs, obs_dim). We use n_envs=1 from
+    the build_env_from_id default; obs is squeezed to (obs_dim,) before
+    std computation.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    key = jax.random.PRNGKey(seed)
+    env_state = env.reset(key)
+    n_envs = env_state.obs.shape[0]  # typically 1
+    expert_state0 = expert.init_state(n_envs)
+
+    def body(carry, _):
+        env_state, expert_state = carry
+        action, new_expert_state = expert(expert_state, env_state.obs)
+        new_env_state = env.step(state=env_state, action=action)
+        return (new_env_state, new_expert_state), new_env_state.obs
+
+    init = (env_state, expert_state0)
+    _, obs_seq = jax.lax.scan(body, init, xs=None, length=int(n_steps))
+    # obs_seq shape: (n_steps, n_envs, obs_dim). Prepend reset obs and squeeze.
+    full = jnp.concatenate([env_state.obs[None], obs_seq], axis=0)  # (T+1, n_envs, D)
+    return full.reshape(-1, full.shape[-1])  # (T+1 * n_envs, D)
+
+
 def compute_one(env_name: str, n_steps: int) -> dict:
     """Return {'env', 'obs_std', 'shape', 'n_used'} for one env."""
     import jax.numpy as jnp
@@ -99,11 +131,6 @@ def compute_one(env_name: str, n_steps: int) -> dict:
     from sac_hyperparam_search import _load_expert_policy  # type: ignore
 
     env, env_params = make_env_by_name(env_name)
-    if env_params is None:
-        return {
-            "env": env_name,
-            "skipped": "no env_params (Playground env); use scalar fallback",
-        }
     expert = _load_expert_policy(env_name, env)
     if not hasattr(expert, "init_state"):
         return {
@@ -111,7 +138,12 @@ def compute_one(env_name: str, n_steps: int) -> dict:
             "skipped": "expert is stateless; cannot reproduce its rollout API here",
         }
 
-    obs_arr = rollout_obs(env, env_params, expert, n_steps=n_steps)
+    if env_params is None:
+        # Mujoco Playground path
+        obs_arr = rollout_obs_playground(env, expert, n_steps=n_steps)
+    else:
+        # target_gym path
+        obs_arr = rollout_obs(env, env_params, expert, n_steps=n_steps)
     std = jnp.std(obs_arr, axis=0) + 1e-6  # epsilon to avoid zero-std dims
     return {
         "env": env_name,
@@ -123,7 +155,7 @@ def compute_one(env_name: str, n_steps: int) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--envs", nargs="+", default=DEFAULT_TARGET_GYM_ENVS)
+    parser.add_argument("--envs", nargs="+", default=DEFAULT_ENVS)
     parser.add_argument("--n-steps", type=int, default=1000,
                         help="Env-steps per rollout (capped by env episode length).")
     args = parser.parse_args()
