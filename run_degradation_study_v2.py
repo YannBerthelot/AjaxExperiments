@@ -55,14 +55,14 @@ DEFAULT_METHODS = [
     "jsrl",
     "residual",
 ]
-DEFAULT_TYPES = ("action_bias", "latency", "obs_noise")
+DEFAULT_TYPES = ("action_bias", "obs_noise")
 
 # Per-type intensity sweeps. Keep three points per axis to match v1's
 # (sigma in {0.25, 0.5, 0.75}) cadence.
 INTENSITIES = {
-    "action_bias": [0.10, 0.25, 0.50],   # uniform half-range on bias
-    "latency":     [1, 5, 20],            # env-step delay (cast to int by worker)
-    "obs_noise":   [0.05, 0.15, 0.30],    # absolute Gaussian std on raw obs
+    "action_bias": [0.10, 0.25, 0.50],   # uniform half-range on per-seed bias
+    "obs_noise":   [0.05, 0.15, 0.30],    # std multiplier on per-dim obs std
+    # "action_dropout": [0.1, 0.3, 0.5],  # deferred; uncomment when wrapper lands
 }
 
 
@@ -73,29 +73,22 @@ class V2Unit:
     deg_type: str
     intensity: float
 
+    def _tag(self) -> str:
+        return f"{self.intensity}"
+
     def name(self) -> str:
-        if self.deg_type == "latency":
-            tag = f"k{int(self.intensity)}"
-        else:
-            tag = f"{self.intensity}"
-        return f"{self.env}/{self.method}/{self.deg_type}/{tag}"
+        return f"{self.env}/{self.method}/{self.deg_type}/{self._tag()}"
 
     def output_path(self) -> Path:
-        if self.deg_type == "latency":
-            tag = f"k{int(self.intensity)}"
-        else:
-            tag = f"{self.intensity}"
         return RESULTS_DIR / (
-            f"{self.env.lower()}__{self.method}__{self.deg_type}__{tag}.json"
+            f"{self.env.lower()}__{self.method}__"
+            f"{self.deg_type}__{self._tag()}.json"
         )
 
     def log_path(self) -> Path:
-        if self.deg_type == "latency":
-            tag = f"k{int(self.intensity)}"
-        else:
-            tag = f"{self.intensity}"
         return LOGS_DIR / (
-            f"{self.env.lower()}__{self.method}__{self.deg_type}__{tag}.log"
+            f"{self.env.lower()}__{self.method}__"
+            f"{self.deg_type}__{self._tag()}.log"
         )
 
     def is_done(self) -> bool:

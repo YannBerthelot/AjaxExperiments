@@ -1,24 +1,26 @@
-"""Expert-degradation sensitivity study — v2: action-pipeline perturbations.
+"""Expert-degradation sensitivity study — v2: deployment-side perturbations.
 
 Complements ``run_degradation_eval.py`` (which perturbs *expert parameters*:
 log-scale on PID gains, phase-wrap on CPG phases). v2 perturbs the
-action / observation pipeline at deployment time, leaving the expert's
-internal tuning intact:
+deployment-side action / observation pipeline at training time, leaving the
+expert's internal tuning intact:
 
-  * ``action_bias``  : ``a' = clip(a* + b, -1, 1)`` with ``b ~ U(-σ, σ)`` drawn
-                       once per call to this script (constant per run; encodes
-                       a miscalibrated actuator zero).
-  * ``latency``      : ``a'(t) = a*(t-k)`` for ``k`` env steps; the first ``k``
-                       steps return zero ("clamped"). State is extended with a
-                       ``(k, action_dim)`` ring buffer.
-  * ``obs_noise``    : the expert sees ``obs + σ·N(0, I)`` per call (additive
-                       Gaussian on raw obs, scale absolute — practitioners may
-                       need to retune σ per env). The agent still sees clean
-                       obs; this is "expert-only" obs noise to keep the change
-                       local to the expert callsite. The "both" interpretation
-                       (agent + expert see the same noisy obs) requires
-                       wrapping the env or the data-collection loop and is
-                       deliberately out of scope for v2.
+  * ``action_bias`` : ``a' = clip(a* + b_i, -1, 1)`` with **per-seed**
+                       ``b_i ~ U(-σ, σ)`` drawn deterministically from
+                       ``fold_in(key, env_idx)``. Each of the ``n_seeds``
+                       parallel envs gets its own constant bias for the run.
+                       Models miscalibrated actuator zero.
+  * ``obs_noise``   : both agent and expert see ``obs + σ·obs_std·N(0, I)``
+                       per env-step. Per-dim obs std is estimated by a
+                       short warmup pass (cached to ``obs_std/<env>.npy``) so
+                       σ is dimensionless and comparable across envs. The
+                       noise hook lives in ``Ajax/src/ajax/environments/
+                       interaction.py:_maybe_noise_obs`` and is opt-in via
+                       env attributes set here.
+  * ``action_dropout`` (TBD, deferred): with prob ``p`` repeat the last
+                       action instead of querying the expert. Models
+                       intermittent expert availability. Implemented as a
+                       stateful wrapper analogous to bias.
 
 Writes ``degradation_v2_results/<env>__<method>__<deg_type>__<intensity>.json``.
 """
@@ -34,16 +36,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DEGRADATION_V2_RESULTS = ROOT / "degradation_v2_results"
 
-DEG_TYPES = ("action_bias", "latency", "obs_noise")
+DEG_TYPES = ("action_bias", "obs_noise")
+OBS_STD_DIR = ROOT / "obs_std"
 
 
 def _intensity_str(deg_type: str, intensity) -> str:
-    """Return a stable filesystem-safe intensity tag for the output filename.
-
-    Latency uses an integer step count; bias and obs_noise are floats.
-    """
-    if deg_type == "latency":
-        return f"k{int(intensity)}"
+    """Return a stable filesystem-safe intensity tag for the output filename."""
     return f"{float(intensity)}"
 
 
@@ -138,28 +136,31 @@ def main() -> int:
     env, _env_params = make_env_by_name(args.env)
     anchor_expert = _load_expert_policy(args.env, env)
 
-    # Probe the action_dim once for the latency wrapper. The expert is
-    # vmapped per-env so we read it from ``anchor_gains`` shape OR from a
-    # zero-state probe.
     action_dim = _probe_action_dim(anchor_expert, env)
 
     if args.degradation_type == "action_bias":
         sigma = float(args.intensity)
+        # Per-seed independent bias: deterministic from (degradation_seed, env_idx).
+        # Wrapper draws the per-env bias at each call via fold_in, so 50 seeds
+        # in a vmapped batch get 50 different biases (each constant across
+        # env steps within a seed).
         bias_key = jax.random.PRNGKey(args.degradation_seed)
-        bias = jax.random.uniform(
-            bias_key, shape=(action_dim,), minval=-sigma, maxval=sigma,
+        degraded = BiasedExpertPolicy(
+            anchor_expert, sigma=sigma, base_key=bias_key,
+            action_dim=action_dim,
         )
-        degraded = BiasedExpertPolicy(anchor_expert, bias)
-    elif args.degradation_type == "latency":
-        k = int(args.intensity)
-        if k < 0:
-            sys.stderr.write(f"[degradation_v2] latency k={k} must be >= 0\n")
-            return 6
-        degraded = DelayedExpertPolicy(anchor_expert, k, action_dim)
     elif args.degradation_type == "obs_noise":
         sigma = float(args.intensity)
-        noise_key = jax.random.PRNGKey(args.degradation_seed)
-        degraded = ObsNoisyExpertPolicy(anchor_expert, sigma, noise_key)
+        # Obs noise is plumbed via Ajax's interaction.py:_maybe_noise_obs hook
+        # (added in Ajax tree). The hook reads two attributes off the env:
+        # _obs_noise_sigma (scalar) and _obs_noise_obs_std ((obs_dim,) per-dim
+        # scale, default 1.0). Both agent and expert see the same noisy obs
+        # because the hook fires AFTER env.step / env.reset, BEFORE the obs
+        # is consumed by either consumer.
+        env._obs_noise_sigma = sigma  # type: ignore[attr-defined]
+        env._obs_noise_obs_std = _load_obs_std(args.env)  # type: ignore[attr-defined]
+        # Expert is unwrapped: the noise is on the env, not the expert.
+        degraded = anchor_expert
     else:
         sys.stderr.write(
             f"[degradation_v2] unknown degradation_type={args.degradation_type!r}\n"
@@ -296,26 +297,48 @@ def _probe_action_dim(expert, env) -> int:
 
 
 class BiasedExpertPolicy:
-    """Adds a constant bias vector to expert actions, then clips to [-1, 1].
+    """Adds a per-seed constant bias to expert actions, then clips to [-1, 1].
 
-    Bias is drawn once at construction (per-run), shape ``(action_dim,)``,
-    sampled from ``U(-σ, σ)``. Same bias used for every call (across env
-    steps and across seeds in a vmapped batch).
+    Each of the ``num_envs`` parallel envs (= seeds in our vmapped training)
+    gets its own bias vector ``b_i ~ U(-σ, σ)``, drawn deterministically
+    from ``fold_in(base_key, env_idx)`` so it is constant across env steps
+    within a seed but varies across seeds.
+
+    The bias is materialized lazily on each call (cheap, deterministic),
+    so we don't need to thread it through state. Stateless calls use
+    ``num_envs`` inferred from ``obs.shape[0]``.
     """
 
-    def __init__(self, base, bias):
+    def __init__(self, base, sigma: float, base_key, action_dim: int):
         self._base = base
-        self._bias = bias
+        self._sigma = float(sigma)
+        self._base_key = base_key
+        self._action_dim = int(action_dim)
+
+    def _per_env_bias(self, num_envs):
+        import jax
+        import jax.numpy as jnp
+        env_keys = jax.vmap(
+            lambda i: jax.random.fold_in(self._base_key, jnp.uint32(i))
+        )(jnp.arange(num_envs, dtype=jnp.uint32))
+        return jax.vmap(
+            lambda k: jax.random.uniform(
+                k, shape=(self._action_dim,),
+                minval=-self._sigma, maxval=self._sigma,
+            )
+        )(env_keys)
 
     def __call__(self, *args):
         import jax.numpy as jnp
         if len(args) == 2:
             state, obs = args
             action, new_state = self._base(state, obs)
-            return jnp.clip(action + self._bias, -1.0, 1.0), new_state
+            biases = self._per_env_bias(obs.shape[0])
+            return jnp.clip(action + biases, -1.0, 1.0), new_state
         (obs,) = args
         action = self._base(obs)
-        return jnp.clip(action + self._bias, -1.0, 1.0)
+        biases = self._per_env_bias(obs.shape[0])
+        return jnp.clip(action + biases, -1.0, 1.0)
 
     def init_state(self, num_envs):
         return self._base.init_state(num_envs)
@@ -330,111 +353,37 @@ class BiasedExpertPolicy:
         return self is other
 
 
-class DelayedExpertPolicy:
-    """k-step latency on expert actions via a (num_envs, k, action_dim) buffer.
+def _load_obs_std(env_name: str):
+    """Load per-dim obs std for ``env_name`` from ``obs_std/<env>.npy``.
 
-    Stateful call: pop oldest action from the buffer, push fresh action onto
-    the right. The first ``k`` outputs are zeros (clamped). Stateless calls
-    fall back to the unwrapped expert (delay is undefined for one-shot
-    queries used by training-time bootstrap targets).
+    Returns a JAX array. Falls back to scalar ``1.0`` (no per-dim scaling)
+    if the cache file is missing — in that case σ is interpreted as
+    absolute noise std on raw obs, and may need per-env retuning.
+
+    To populate the cache, run ``compute_obs_std.py --env <name>``
+    offline once per env; the resulting ``.npy`` file is committed to git.
     """
-
-    def __init__(self, base, k: int, action_dim: int):
-        self._base = base
-        self._k = int(k)
-        self._action_dim = int(action_dim)
-
-    def __call__(self, *args):
-        import jax.numpy as jnp
-        if len(args) == 2:
-            state, obs = args
-            base_state, buf = state
-            fresh_action, new_base_state = self._base(base_state, obs)
-            if self._k == 0:
-                return fresh_action, (new_base_state, buf)
-            output_action = buf[..., 0, :]
-            new_buf = jnp.concatenate(
-                [buf[..., 1:, :], fresh_action[..., None, :]],
-                axis=-2,
-            )
-            return output_action, (new_base_state, new_buf)
-        (obs,) = args
-        return self._base(obs)
-
-    def init_state(self, num_envs):
-        import jax.numpy as jnp
-        base_state = self._base.init_state(num_envs)
-        if self._k == 0:
-            buf = jnp.zeros((num_envs, 1, self._action_dim))
-        else:
-            buf = jnp.zeros((num_envs, self._k, self._action_dim))
-        return (base_state, buf)
-
-    def __getattr__(self, name):
-        return getattr(self._base, name)
-
-    def __hash__(self):
-        return id(self)
-
-    def __eq__(self, other):
-        return self is other
+    import jax.numpy as jnp
+    cache = OBS_STD_DIR / f"{env_name.lower()}.npy"
+    if not cache.exists():
+        sys.stderr.write(
+            f"[obs_std] {cache} not found; using obs_std=1.0 (no per-dim scaling). "
+            f"Run compute_obs_std.py to populate.\n"
+        )
+        return jnp.asarray(1.0)
+    import numpy as np
+    arr = np.load(cache)
+    return jnp.asarray(arr)
 
 
-class ObsNoisyExpertPolicy:
-    """Adds Gaussian noise to obs before passing to the wrapped expert.
-
-    Per-step independent noise via PRNG fold_in on a step counter that
-    lives in the wrapper's state. The agent still sees the clean obs from
-    the env: only the expert's input is corrupted. This is "expert-only"
-    obs noise; the "both" interpretation (agent + expert) requires hooking
-    the env-step or the data-collection loop and is out of scope for v2.
-
-    Stateless calls add noise per-call using a fresh fold_in on a hash of
-    the obs (so the same obs gives the same noise — deterministic but
-    decoupled from the rollout step counter).
-    """
-
-    def __init__(self, base, sigma: float, base_key):
-        self._base = base
-        self._sigma = float(sigma)
-        self._base_key = base_key
-
-    def __call__(self, *args):
-        import jax
-        import jax.numpy as jnp
-        if len(args) == 2:
-            state, obs = args
-            base_state, step = state
-            key = jax.random.fold_in(self._base_key, step)
-            num_envs = obs.shape[0]
-            keys = jax.random.split(key, num_envs)
-            noise = jax.vmap(
-                lambda k, o: jax.random.normal(k, shape=o.shape)
-            )(keys, obs)
-            noisy_obs = obs + self._sigma * noise
-            action, new_base_state = self._base(base_state, noisy_obs)
-            return action, (new_base_state, step + 1)
-        # Stateless fallback: deterministic-per-obs noise via obs-hash fold.
-        (obs,) = args
-        key = jax.random.fold_in(self._base_key, 0)
-        noise = jax.random.normal(key, shape=obs.shape)
-        noisy_obs = obs + self._sigma * noise
-        return self._base(noisy_obs)
-
-    def init_state(self, num_envs):
-        import jax.numpy as jnp
-        base_state = self._base.init_state(num_envs)
-        step = jnp.zeros((), dtype=jnp.int32)
-        return (base_state, step)
-
-    def __getattr__(self, name):
-        return getattr(self._base, name)
-
-    def __hash__(self):
-        return id(self)
-
-    def __eq__(self, other):
-        return self is other
+# NOTE: action_dropout (deferred per user; "do at end if time"). Will be
+# implemented as a stateful wrapper:
+#   class DropoutExpertPolicy:
+#       state = (base_state, last_action, prng_step)
+#       __call__: with prob p, return last_action; else fresh_action and update
+#       last_action. Stateless calls fall back to unwrapped expert.
+# Add `action_dropout` to DEG_TYPES, INTENSITIES (e.g. p in {0.1, 0.3, 0.5}),
+# and a dispatch branch in main().
 
 
 if __name__ == "__main__":

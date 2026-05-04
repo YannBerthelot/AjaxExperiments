@@ -30,6 +30,24 @@ echo "[setup_remote] REPO_ROOT=$REPO_ROOT  GH_USER=$GH_USER"
 mkdir -p "$REPO_ROOT"
 cd "$REPO_ROOT"
 
+# 0. Install poetry if not on PATH. Uses the official installer; idempotent.
+if command -v poetry >/dev/null 2>&1; then
+  echo "[setup_remote] poetry already installed: $(poetry --version)"
+else
+  echo "[setup_remote] installing poetry via official installer"
+  curl -sSL https://install.python-poetry.org | python3 -
+  # poetry installs to ~/.local/bin by default; ensure it's on PATH for this shell.
+  export PATH="$HOME/.local/bin:$PATH"
+  if ! command -v poetry >/dev/null 2>&1; then
+    echo "[setup_remote] ERROR: poetry not on PATH after install. Add" \
+         "\$HOME/.local/bin to PATH and re-run." >&2
+    exit 1
+  fi
+  echo "[setup_remote] poetry installed: $(poetry --version)"
+  echo "[setup_remote] NOTE: add 'export PATH=\"\$HOME/.local/bin:\$PATH\"'" \
+       "to your shell rc file to keep poetry on PATH for future sessions."
+fi
+
 # 1. Clone (or pull) the three repos.
 for repo in Ajax TargetGym AjaxExperiments; do
   if [ -d "$repo/.git" ]; then
