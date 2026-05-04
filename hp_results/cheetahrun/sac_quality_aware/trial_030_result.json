@@ -1,0 +1,31 @@
+{
+  "trial_number": 30,
+  "metric": 597.0085710797991,
+  "elapsed_s": 2016.2424507141113,
+  "run_ids": [
+    "m6mg0eim",
+    "a34ctiep",
+    "r4t4uxqg",
+    "v3praodg",
+    "awwv78ku",
+    "u49wvhun",
+    "1q7l4ljx",
+    "jzfinlxu",
+    "ky8rdh1g",
+    "1l3ax6c2",
+    "4xi502io",
+    "wjzg5dqj",
+    "9hlumbpn",
+    "fw603b5j",
+    "0ch7tggr",
+    "bbayx35g",
+    "6xh7gpna",
+    "3khh9jak",
+    "cdtjncca",
+    "g6qr5htd"
+  ],
+  "tb_folder": "hp_results/cheetahrun/sac_quality_aware/trial_030_tb",
+  "phase": 1,
+  "n_seeds": 20,
+  "seed_offset": 0
+}

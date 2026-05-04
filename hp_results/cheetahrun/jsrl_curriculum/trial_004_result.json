@@ -1,0 +1,31 @@
+{
+  "trial_number": 4,
+  "metric": 512.4376040867397,
+  "elapsed_s": 1542.0232656002045,
+  "run_ids": [
+    "50afw67o",
+    "3pvnnf7y",
+    "tcfqrqy2",
+    "wwvbun7y",
+    "bo9l7pft",
+    "5uqr34f1",
+    "xcb9x4fy",
+    "yam6z8xn",
+    "iiq9nt0q",
+    "bnifq6fn",
+    "zw2ffrd2",
+    "h9vdwhaa",
+    "uxmx3770",
+    "1iazges8",
+    "avm5fruf",
+    "gzx5sxvz",
+    "dfoymwng",
+    "v4lf47jt",
+    "b1sta1z1",
+    "a2c782qf"
+  ],
+  "tb_folder": "hp_results/cheetahrun/jsrl_curriculum/trial_004_tb",
+  "phase": 1,
+  "n_seeds": 20,
+  "seed_offset": 0
+}

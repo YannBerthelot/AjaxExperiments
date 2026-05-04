@@ -1,0 +1,29 @@
+{
+  "trial_number": 127,
+  "metric": 564.2718899681455,
+  "elapsed_s": 2035.1780240535736,
+  "run_ids": [
+    "4r6643ow",
+    "tjr7vduq",
+    "zl1jyapi",
+    "okrf93sm",
+    "a9n9hovi",
+    "3kd9tjy4",
+    "kka78mue",
+    "wmh3i07c",
+    "j1bbx5ut",
+    "gk1705yy",
+    "6znuiume",
+    "98mhjgdl",
+    "hnuk4z3a",
+    "8pds69mh",
+    "1l25udq8",
+    "5mpscydt",
+    "glaapw0p",
+    "s1afho8h",
+    "75ytv001",
+    "acj0zhce"
+  ],
+  "tb_folder": "hp_results/cheetahrun/edge/trial_127_tb",
+  "phase": 1
+}

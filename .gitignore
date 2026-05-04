@@ -26,6 +26,30 @@ plots/
 plots_*/
 .plot_cache/
 hp_results/
+# Whitelist HPO essentials needed by run_degradation_v2.py to pick up best
+# trial params on a remote clone. Excludes TB events (regenerable),
+# depth-4+ subdirs (trial_*_tb dirs), and any *backup*/legacy/etc dirs.
+!hp_results/
+!hp_results/*/
+!hp_results/*/*/
+# Ignore everything inside depth-3 dirs by default; whitelist below.
+hp_results/*/*/*
+# Re-ignore depth-4+ subdirs (TB events).
+hp_results/*/*/*/
+# Re-ignore stale / backup / legacy method dirs at depth 3.
+hp_results/*/*backup*/
+hp_results/*/legacy_*/
+hp_results/*/buggy_*/
+hp_results/*/r_edge_bow/
+hp_results/*/seeds*_baseline/
+hp_results/*/*.pre_*/
+hp_results/*/*pre_full_study*/
+# Allow the essential files at depth 3.
+!hp_results/*/*/optuna.db
+!hp_results/*/*/trial_*_params.json
+!hp_results/*/*/trial_*_phase3_result.json
+!hp_results/*/*/trial_*_phase2_result.json
+!hp_results/*/*/trial_*_result.json
 hyperparams/
 logs/
 sweep/

@@ -1,0 +1,31 @@
+{
+  "trial_number": 13,
+  "metric": 223.64610007149832,
+  "elapsed_s": 1813.526005268097,
+  "run_ids": [
+    "x9q9rzz1",
+    "iw5jmnaa",
+    "5otwkwax",
+    "o0ceefyd",
+    "j18z8nxs",
+    "l476xgrc",
+    "hhvt9b7w",
+    "2zm1hyy4",
+    "c9i6i0b1",
+    "mvsk0yl5",
+    "sjbhspwm",
+    "9az8syzd",
+    "0wvb2cld",
+    "uqcweart",
+    "6zxqqi1q",
+    "xdr378tf",
+    "djuly1g8",
+    "o41yj5io",
+    "2jieny7w",
+    "8mxcn32f"
+  ],
+  "tb_folder": "hp_results/fourtank/edge_qa_optimistic/trial_013_tb",
+  "phase": 1,
+  "n_seeds": 20,
+  "seed_offset": 0
+}

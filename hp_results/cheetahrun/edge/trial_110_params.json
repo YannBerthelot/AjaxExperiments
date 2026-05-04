@@ -1,0 +1,18 @@
+{
+  "trial_number": 110,
+  "actor_lr": 0.000915740129903244,
+  "critic_lr": 0.0006825035709035385,
+  "alpha_lr": 0.00011588739540184702,
+  "gamma": 0.9705801699283488,
+  "tau": 0.0011872858812121841,
+  "alpha_init": 0.1703433298998112,
+  "target_entropy_per_dim": -0.9112188039672182,
+  "batch_size": 512,
+  "arch_width": 256,
+  "max_grad_norm": 0.5,
+  "method": "edge",
+  "exploration_decay_frac": 0.5382757757917369,
+  "exploration_tau": 2.4416735414626562,
+  "fixed_exploration_prob": 0.44510497257898113,
+  "policy_update_start": 1555
+}

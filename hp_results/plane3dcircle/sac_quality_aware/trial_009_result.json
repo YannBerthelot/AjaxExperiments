@@ -1,0 +1,31 @@
+{
+  "trial_number": 9,
+  "metric": -9658.346558198475,
+  "elapsed_s": 1070.0079870224,
+  "run_ids": [
+    "cpf679kc",
+    "gvjbetqv",
+    "laa6tezq",
+    "4her1q8a",
+    "oco17yu2",
+    "kx76f9n3",
+    "f065hm68",
+    "n5ktca54",
+    "3zm97nqk",
+    "aeeuy23h",
+    "6v51gy6x",
+    "8eniis1m",
+    "gzpfsbe4",
+    "h2k4sxy5",
+    "mvzzkfk3",
+    "wsb3clxs",
+    "d21ulv7j",
+    "f8jpoyxa",
+    "0o5jdkr4",
+    "xaynlprj"
+  ],
+  "tb_folder": "hp_results/plane3dcircle/sac_quality_aware/trial_009_tb",
+  "phase": 1,
+  "n_seeds": 20,
+  "seed_offset": 0
+}

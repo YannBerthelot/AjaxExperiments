@@ -1,0 +1,31 @@
+{
+  "trial_number": 5,
+  "metric": 188.6126108442034,
+  "elapsed_s": 377.3976900577545,
+  "run_ids": [
+    "iogvq59a",
+    "a1ubkxwr",
+    "x21ctc50",
+    "35islt4n",
+    "yh00v9n2",
+    "74bkrb5u",
+    "9446mnvz",
+    "sc8vl9hg",
+    "n1yb4j70",
+    "qyucmnmv",
+    "phw7wc8x",
+    "vdg9y4a4",
+    "21num7db",
+    "n01d1vvx",
+    "bo7l8j2v",
+    "r70n40yc",
+    "3hvw27du",
+    "n0iamtq0",
+    "wuasftsj",
+    "5bxi8j8x"
+  ],
+  "tb_folder": "hp_results/fourtank/ibrl/trial_005_tb",
+  "phase": 1,
+  "n_seeds": 20,
+  "seed_offset": 0
+}

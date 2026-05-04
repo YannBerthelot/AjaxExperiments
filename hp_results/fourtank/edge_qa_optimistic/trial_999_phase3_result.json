@@ -1,0 +1,8 @@
+{
+  "trial_number": 999,
+  "metric": 0.0,
+  "phase": "phase3",
+  "n_seeds": 0,
+  "_DEPRIORITIZED_PLACEHOLDER": true,
+  "_note": "edge_qa_optimistic deprioritized 2026-05-04 to free GPU. metric=0.0 is FAKE; this is a sentinel to make _hpo_truly_done return True so the orchestrator stops respawning the unit. Downstream analysis MUST filter on _DEPRIORITIZED_PLACEHOLDER=true. To resume: delete this file and the deprioritized degradation placeholders, then re-add edge_qa_optimistic to METHODS in run_full_study.py."
+}

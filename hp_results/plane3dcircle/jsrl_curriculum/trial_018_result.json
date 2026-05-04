@@ -1,0 +1,31 @@
+{
+  "trial_number": 18,
+  "metric": 3977.4122851235525,
+  "elapsed_s": 910.1182820796967,
+  "run_ids": [
+    "ggcg6hai",
+    "d07j0lbc",
+    "yj2y0o41",
+    "ya94brpq",
+    "46xqw38c",
+    "hkiokdh0",
+    "i4xzg11r",
+    "gl98ls0w",
+    "3f75kucf",
+    "d8a12hkr",
+    "ec65z1uy",
+    "uj4u55ig",
+    "ev1vaake",
+    "1brt1ph7",
+    "1c9fzfdf",
+    "cxx80g6a",
+    "f4cvtol0",
+    "oduyn6t9",
+    "r6urz71w",
+    "r4s7w7fa"
+  ],
+  "tb_folder": "hp_results/plane3dcircle/jsrl_curriculum/trial_018_tb",
+  "phase": 1,
+  "n_seeds": 20,
+  "seed_offset": 0
+}

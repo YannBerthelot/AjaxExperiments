@@ -1,0 +1,31 @@
+{
+  "trial_number": 1,
+  "metric": 5385.046714564733,
+  "elapsed_s": 901.7837896347046,
+  "run_ids": [
+    "mqe2bxr5",
+    "c8bt20lz",
+    "idfsqhij",
+    "9yi7sojy",
+    "mjxxa2bl",
+    "l0vn9i0w",
+    "noj0ivwb",
+    "zfhkxryr",
+    "38ydbo96",
+    "nty25qm8",
+    "gr35rzx0",
+    "u6ynah6t",
+    "77gtwvg6",
+    "zkclavg2",
+    "o7ks8gfw",
+    "lztw03ia",
+    "68zbs0ie",
+    "ev89juju",
+    "twxjgmbb",
+    "qi5pejyi"
+  ],
+  "tb_folder": "hp_results/glassfurnace/jsrl/trial_001_tb",
+  "phase": 1,
+  "n_seeds": 20,
+  "seed_offset": 0
+}
