@@ -78,8 +78,19 @@ final_results/
 final_results_tb/
 ablation_results/
 degradation_results/
+degradation_v2_results/
+study_v2_logs/
 checkpoints/
 results/
+directional_test_results.json
+
+# Remote/VM infrastructure scripts (not part of reproduction)
+bootstrap_remote.sh
+fetch_results_v2.sh
+push_to_remote.sh
+setup_remote.sh
+run_safely.sh
+run_v2_study.sh
 
 # Diagnostic scripts (one-off, not part of reproduction)
 diag_*.py

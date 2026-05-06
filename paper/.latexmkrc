@@ -7,7 +7,7 @@
 # - runs biber/bibtex and reruns pdflatex automatically when needed
 
 $pdf_mode = 1;                         # produce PDF
-$pdflatex = 'pdflatex %O %S';          # classic engine
+$pdflatex = 'pdflatex -interaction=nonstopmode %O %S';  # classic engine
 $bibtex_use = 2;                       # run bibtex when cited entries exist
 @default_files = ('paper.tex');        # explicit target (ignore appendix_*.tex)
 

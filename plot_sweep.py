@@ -3980,9 +3980,13 @@ _PAPER_EXPERT: dict[str, float] = {
 # paper). Fall back to expert + 5130 ≈ IBRL P3D phase3 calibration if
 # unset, so curves don't crash on partial-data envs.
 _PAPER_J_STAR: dict[str, float] = {
-    # Plane3DCircle: best phase3 IQM is jsrl-tt = 9650.8; round up to
-    # 10000 so headroom-fraction stays interpretable.
-    "Plane3DCircle": 10000.0,
+    # Theoretical / hand-set per-task ceilings used to expert-normalize.
+    # Numbers must match the J_ref values reported in the paper's
+    # Appendix expert-headroom table; keep in sync if either changes.
+    "Plane3DCircle": 10000.0,    # theoretical episodic max
+    "FourTank":      500.0,       # theoretical episodic max
+    "GlassFurnace":  6000.0,      # hand-set (no closed-form ceiling)
+    "CheetahRun":    1000.0,      # theoretical episodic max
 }
 
 # Methods to plot in the paper, in the canonical legend order. Colors
@@ -4627,7 +4631,7 @@ def _paper_render_degradation_bars(
 
 
 def _paper_render_ablation_bar(env: str) -> Optional[Path]:
-    """Per-env ablation bar chart for the EDGE-QA design ablations."""
+    """Per-env ablation bar chart for the EDGE design ablations."""
     env_slug = env.lower()
     rows = []
     # Reference: edge-qa final score on this env (no ablation).
@@ -4642,7 +4646,7 @@ def _paper_render_ablation_bar(env: str) -> Optional[Path]:
             last_step = int(steps[-1])
             mask = steps >= max(0, last_step - 200_000)
             window = values[mask]
-            rows.append(("EDGE-QA (full)", float(_iqm(window).mean())))
+            rows.append(("EDGE (full)", float(_iqm(window).mean())))
     # Variants
     for f in sorted(_PAPER_ABL_DIR.glob(f"{env_slug}__*.json")):
         variant = f.stem.split("__", 1)[1]
@@ -4666,7 +4670,7 @@ def _paper_render_ablation_bar(env: str) -> Optional[Path]:
         ax.axhline(expert, color="tab:red", ls=":", lw=1.0,
                    label=f"expert = {expert:.0f}")
     ax.set_ylabel("final eval reward")
-    ax.set_title(f"{env} — EDGE-QA design ablations")
+    ax.set_title(f"{env} — EDGE design ablations")
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
     ax.grid(axis="y", alpha=0.3)
     ax.legend(loc="lower right", fontsize=9, frameon=False)
@@ -5224,6 +5228,343 @@ def _paper_render_aggregated(baseline: str = "ibrl",
     fname = (f"aggregated_rliable_{env.lower()}.pdf"
              if env is not None else "aggregated_rliable.pdf")
     out_path = _PAPER_OUT_DIR / fname
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+_PAPER_SAMPLE_EFF_THRESHOLDS: dict[str, list[float]] = {
+    # Three reward thresholds per env (low / mid / high). Picked relative to
+    # J_exp + ceiling so each panel has a meaningful crossing event for at
+    # least the strongest methods.
+    "Plane3DCircle": [0.0, 4766.0, 8000.0],   # zero / expert / strong
+    "FourTank":      [200.0, 240.0, 250.0],   # below expert / near expert / above
+    "GlassFurnace":  [4000.0, 4315.0, 5300.0],
+    "CheetahRun":    [300.0, 600.0, 800.0],
+}
+
+
+def _paper_render_step_sample_eff(
+    envs: tuple = ("Plane3DCircle", "FourTank", "GlassFurnace", "CheetahRun"),
+) -> Optional[Path]:
+    """Step-based sample-efficiency figure: 4 envs × 3 reward-threshold
+    panels = 12 panels total. Each panel: methods on y-axis, IQM (vertical
+    tick) of first-permanent-crossing step + 95% bootstrap CI rectangle on
+    x-axis (raw env steps). Annotation: IQM step count and (n_crossed /
+    n_total) censoring info.
+
+    Style matches the per-env headline rliable bars: same fill/tick aesthetic.
+    """
+    _paper_apply_style()
+    proposed = "sac_quality_aware"
+    n_envs = len(envs)
+    n_cols = 3  # three thresholds per env
+    fig, axes = plt.subplots(
+        n_envs, n_cols,
+        figsize=(13.5, 2.1 * n_envs),
+        gridspec_kw={"wspace": 0.55, "hspace": 0.65},
+    )
+    axes = np.atleast_2d(axes)
+    bar_h = 0.34
+    iqm_lw = 2.4
+    any_data = False
+
+    for r, env in enumerate(envs):
+        thresholds = _PAPER_SAMPLE_EFF_THRESHOLDS.get(env)
+        if thresholds is None:
+            for c in range(n_cols):
+                axes[r, c].set_axis_off()
+            continue
+        # Cache per-method final-window-mean curves to avoid re-reading TB.
+        per_method_curves = {}
+        for m, label, color in _PAPER_METHODS:
+            sel = _paper_best_trial_tb(env.lower(), m)
+            if sel is None:
+                continue
+            tb, run_ids = sel
+            curves = _paper_read_seed_curves(
+                tb, "Eval/episodic_mean_reward", run_ids=run_ids,
+            )
+            steps, values = _paper_curves_to_array(curves)
+            if values.size == 0:
+                continue
+            per_method_curves[m] = (steps, values, label, color)
+
+        for c, thr in enumerate(thresholds):
+            ax = axes[r, c]
+            rows = []  # (label, color, is_prop, iqm, q1, q3, n_cross, n_tot)
+            for m, (steps, values, label, color) in per_method_curves.items():
+                # Per-seed first-permanent-crossing step
+                n_seeds = values.shape[1]
+                cross = np.full(n_seeds, np.nan)
+                for s in range(n_seeds):
+                    seed_curve = values[:, s]
+                    cs = first_permanent_crossing(steps, seed_curve, thr)
+                    if cs is not None:
+                        cross[s] = cs
+                n_cross = int(np.sum(~np.isnan(cross)))
+                n_tot = n_seeds
+                if n_cross == 0:
+                    continue
+                # Censor non-crossings at last step (RMST-style)
+                last_step = int(steps[-1])
+                cross_filled = np.where(np.isnan(cross), last_step, cross)
+                iqm, q1, q3 = _bootstrap_scalar_iqm_ci(cross_filled)
+                if np.isnan(iqm):
+                    continue
+                rows.append((label, color, m == proposed,
+                             iqm, q1, q3, n_cross, n_tot))
+            if not rows:
+                ax.text(0.5, 0.5, "no crossings",
+                        transform=ax.transAxes, ha="center", va="center",
+                        fontsize=9, color="#777777")
+                ax.set_xticks([]); ax.set_yticks([])
+                ax.spines[["top", "right"]].set_visible(False)
+                ax.set_title(f"{env}: $J\\geq{thr:g}$"
+                             if c == 1 else f"$J\\geq{thr:g}$",
+                             fontsize=10, pad=4)
+                continue
+            any_data = True
+            for yi, (label, color, is_prop, iqm, q1, q3, nc, nt) in enumerate(rows):
+                ax.fill_betweenx(
+                    [yi - bar_h, yi + bar_h], q1, q3,
+                    color=color, alpha=0.40 if is_prop else 0.22,
+                    linewidth=0,
+                )
+                for xv in (q1, q3):
+                    ax.plot([xv, xv], [yi - bar_h, yi + bar_h],
+                            color=color, linewidth=1.0, alpha=0.7)
+                ax.plot([iqm, iqm], [yi - bar_h, yi + bar_h],
+                        color=color, linewidth=iqm_lw, solid_capstyle="butt")
+            # Auto-window x-axis. Reserve ~38% of the panel width on the
+            # right for the per-row annotation text so it doesn't bleed
+            # into the next panel.
+            xs_lo = min(r2[4] for r2 in rows)  # min q1
+            xs_hi = max(r2[5] for r2 in rows)  # max q3
+            data_pad = (xs_hi - xs_lo) * 0.08 or xs_hi * 0.04
+            data_lo = max(0.0, xs_lo - data_pad)
+            data_hi = xs_hi + data_pad
+            data_span = data_hi - data_lo
+            ax.set_xlim(data_lo, data_hi + 0.55 * data_span)
+            ax.set_yticks(range(len(rows)))
+            ax.set_yticklabels(
+                [(f"$\\mathbf{{{lab}}}$" if is_p else lab)
+                 for (lab, _, is_p, _, _, _, _, _) in rows],
+                fontsize=8,
+            )
+            ax.invert_yaxis()
+            ax.tick_params(axis="y", length=0)
+            ax.tick_params(axis="x", labelsize=8)
+            ax.spines[["top", "right"]].set_visible(False)
+            ax.grid(axis="x", linestyle="--", linewidth=0.5, alpha=0.5)
+            # Format step ticks as 200k / 1M
+            from matplotlib.ticker import FuncFormatter
+
+            def _fmt_steps(x, _pos):
+                if x >= 1e6:
+                    return f"{x/1e6:.1f}M".rstrip("0").rstrip(".") + "M" if False else f"{x/1e6:.2g}M"
+                if x >= 1e3:
+                    return f"{x/1e3:.0f}k"
+                return f"{x:.0f}"
+            ax.xaxis.set_major_formatter(FuncFormatter(_fmt_steps))
+            # Annotation column: place text inside the right-most ~35% of
+            # the panel (which we reserved above), right-aligned at the
+            # panel's right edge so columns line up across rows.
+            ann_x = data_hi + 0.05 * data_span
+            for yi, (label, color, is_prop, iqm, q1, q3, nc, nt) in enumerate(rows):
+                cens = "" if nc == nt else "$\\dagger$"
+                if iqm >= 1e6:
+                    iqm_str = f"{iqm/1e6:.1f}M"
+                else:
+                    iqm_str = f"{iqm/1e3:.0f}k"
+                txt = f"{iqm_str}{cens}  ({nc}/{nt})"
+                ax.text(
+                    ann_x, yi, txt,
+                    fontsize=7, va="center", ha="left",
+                    color=color, fontweight="bold" if is_prop else "regular",
+                    clip_on=True,
+                )
+            if r == 0:
+                ax.set_title(f"$J \\geq {thr:g}$", fontsize=10, pad=4)
+            else:
+                ax.set_title(f"$J \\geq {thr:g}$", fontsize=9, pad=4)
+            if c == 0:
+                ax.set_ylabel(env, fontsize=10, fontweight="bold",
+                              labelpad=8)
+            if r == n_envs - 1:
+                ax.set_xlabel("Environment steps", fontsize=9)
+
+    if not any_data:
+        plt.close(fig)
+        return None
+    _PAPER_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = _PAPER_OUT_DIR / "sample_eff_steps_per_env.pdf"
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _paper_render_per_env_headline(
+    envs: tuple = ("Plane3DCircle", "FourTank", "GlassFurnace", "CheetahRun"),
+    censor: Optional[dict] = None,
+    out_name: str = "per_env_headline.pdf",
+    metric: str = "ena",
+) -> Optional[Path]:
+    """Per-env headline: single-row rliable layout (à la Agarwal et al.
+    2021). Each panel = one env; methods on y-axis (shared, drawn only
+    on the leftmost panel); per-method IQM (vertical tick) inside a
+    bootstrap-CI rectangle on x-axis.
+
+    ``metric``:
+      - ``"ena"``: x-axis = expert-normalized advantage
+        $\\tilde\\Delta = (J - J_{\\mathrm{exp}})/(J_{\\mathrm{ref}} -
+        J_{\\mathrm{exp}})$. $0$ = expert, $1$ = reference scale.
+      - ``"raw_advantage"``: x-axis = $J - J_{\\mathrm{exp}}$ (raw).
+      - ``"raw"``: x-axis = $J$ (raw final return).
+
+    ``censor[env]`` (in the same units as the chosen x-axis): optional
+    window. Methods outside the window become arrows with their value
+    annotated.
+    """
+    _paper_apply_style()
+    censor = censor or {}
+    n_envs = len(envs)
+    fig, axes = plt.subplots(
+        1, n_envs, figsize=(2.9 * n_envs + 0.6, 2.7),
+        gridspec_kw={"wspace": 0.18},
+        sharey=True,
+    )
+    if n_envs == 1:
+        axes = [axes]
+    proposed = "sac_quality_aware"
+
+    any_data = False
+    for k, env in enumerate(envs):
+        ax = axes[k]
+        # Per-env transform: ENA (default), raw advantage, or raw J.
+        expert = _PAPER_EXPERT.get(env, 0.0)
+        j_star = _PAPER_J_STAR.get(env)
+        if metric == "ena":
+            denom = (j_star - expert) if (j_star is not None
+                                          and (j_star - expert) > 0) else 1.0
+            transform = lambda v: (v - expert) / denom
+        elif metric == "raw_advantage":
+            transform = lambda v: v - expert
+        else:  # raw
+            transform = lambda v: v
+        items = []  # (label, iqm, q1, q3, color, is_prop)
+        for m, label, color in _PAPER_METHODS:
+            arr = _paper_per_seed_final(env, m)
+            if arr is None or arr.size == 0:
+                continue
+            iqm, q1, q3 = _bootstrap_scalar_iqm_ci(arr)
+            if np.isnan(iqm):
+                continue
+            items.append((label, transform(iqm), transform(q1),
+                          transform(q3), color, m == proposed))
+        if not items:
+            ax.set_axis_off()
+            ax.set_title(env, fontsize=10)
+            continue
+        any_data = True
+
+        x_window = censor.get(env)
+        n = len(items)
+        y = np.arange(n)
+        bar_h = 0.34
+        iqm_lw = 2.4
+        for i, (label, iqm, q1, q3, color, is_prop) in enumerate(items):
+            on_canvas = (
+                x_window is None
+                or (x_window[0] <= iqm <= x_window[1])
+            )
+            if on_canvas:
+                qlo = max(q1, x_window[0]) if x_window else q1
+                qhi = min(q3, x_window[1]) if x_window else q3
+                ax.fill_betweenx(
+                    [i - bar_h, i + bar_h], qlo, qhi,
+                    color=color, alpha=0.40 if is_prop else 0.22,
+                    linewidth=0,
+                )
+                for xv in (qlo, qhi):
+                    ax.plot([xv, xv], [i - bar_h, i + bar_h],
+                            color=color, linewidth=1.0, alpha=0.7)
+                ax.plot([iqm, iqm], [i - bar_h, i + bar_h],
+                        color=color, linewidth=iqm_lw, solid_capstyle="butt")
+            else:
+                # Off-canvas: left arrow if iqm < window, right arrow if >.
+                arrow_dx = 0.04 * (x_window[1] - x_window[0])
+                if iqm < x_window[0]:
+                    edge_x = x_window[0]
+                    tip_x, base_x = edge_x, edge_x + arrow_dx
+                    text_x, text_ha = edge_x + arrow_dx * 1.4, "left"
+                else:
+                    edge_x = x_window[1]
+                    tip_x, base_x = edge_x, edge_x - arrow_dx
+                    text_x, text_ha = edge_x - arrow_dx * 1.4, "right"
+                ax.annotate(
+                    "", xy=(tip_x, i), xytext=(base_x, i),
+                    arrowprops=dict(
+                        arrowstyle="-|>", color=color, lw=1.4,
+                        shrinkA=0, shrinkB=0,
+                    ),
+                    annotation_clip=False,
+                )
+                # Format depends on metric scale; ENA is in [-3, 1.5]
+                # roughly so 2 decimals; raw can be in the thousands.
+                if metric == "ena":
+                    ann_str = f"{iqm:+.2f}"
+                else:
+                    ann_str = f"{iqm:+.0f}"
+                ax.text(
+                    text_x, i, ann_str,
+                    color=color, fontsize=9, va="center", ha=text_ha,
+                    fontweight="bold" if is_prop else "regular",
+                )
+        if k == 0:
+            ax.set_yticks(y)
+            ax.set_yticklabels(
+                [(f"$\\mathbf{{{lab}}}$" if is_p else lab)
+                 for (lab, _, _, _, _, is_p) in items],
+                fontsize=10,
+            )
+        ax.invert_yaxis()
+        ax.tick_params(axis="y", length=0)
+        ax.tick_params(axis="x", labelsize=9)
+        ax.spines[["top", "right"]].set_visible(False)
+        ax.grid(axis="x", linestyle="--", linewidth=0.4, alpha=0.5)
+        ax.set_title(env, fontsize=12, pad=4)
+        if x_window is not None:
+            ax.set_xlim(*x_window)
+        else:
+            # Auto-zoom on visible data with a small pad. Don't force
+            # 0 into the range — when all methods sit far from expert
+            # parity, including 0 squashes the bars.
+            qs = [r[2] for r in items] + [r[3] for r in items]
+            xs_lo, xs_hi = min(qs), max(qs)
+            pad = max((xs_hi - xs_lo) * 0.10, 1e-6)
+            ax.set_xlim(xs_lo - pad, xs_hi + pad)
+        # Mark expert parity only if it lands inside the visible window.
+        if metric in {"ena", "raw_advantage"}:
+            xlo, xhi = ax.get_xlim()
+            if xlo <= 0.0 <= xhi:
+                ax.axvline(0.0, color="#888888", linewidth=0.7,
+                           linestyle="--", alpha=0.7, zorder=0)
+    if metric == "ena":
+        xlabel = ("ENA $= (J - J_{\\mathrm{exp}})/(J_{\\mathrm{ref}} -"
+                  " J_{\\mathrm{exp}})$ ($0$ = expert, $1$ = reference)")
+    elif metric == "raw_advantage":
+        xlabel = "$J - J_{\\mathrm{exp}}$ (expert parity at $0$)"
+    else:
+        xlabel = "IQM final return"
+    fig.supxlabel(xlabel, fontsize=11, y=-0.06)
+
+    if not any_data:
+        plt.close(fig)
+        return None
+    _PAPER_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = _PAPER_OUT_DIR / out_name
     plt.tight_layout()
     plt.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)

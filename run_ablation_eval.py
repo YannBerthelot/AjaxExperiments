@@ -91,6 +91,33 @@ ABLATION_VARIANTS: dict = {
     "expert_prefill": {
         "expert_buffer_n_steps": 100_000,
     },
+    # ──────── Compositionality with other expert-using mechanisms ────────
+    # JSRL-curriculum on top of EDGE-QA: per-episode handoff at decaying
+    # in-episode horizon H_t while EDGE-QA's LCB gate handles the
+    # post-handoff segment. Tests whether the curriculum's early-episode
+    # expert coverage composes with EDGE-QA's late-episode quality-aware
+    # gating, or whether they redundantly compete.
+    "edge_qa_with_curriculum": {
+        "jsrl_curriculum": True,
+        "jsrl_decay_frac": 0.5,
+        "__needs_episode_length": True,
+    },
+    # ──────── Pessimism axis (discrete) ────────
+    # Disable pessimism (β = 0) while keeping the softmax gate over
+    # min-ensemble Q. The HPO sweep over β ∈ [0.1, 5.0] already shows
+    # the optimum is task-dependent; this discrete cell isolates the
+    # contribution of β > 0 from the contribution of the gate form itself.
+    "no_pessimism": {
+        "lcb_beta_init": 0.0,
+    },
+    # ──────── Ensemble size (one-off) ────────
+    # HPO picks K ∈ {2, 4}; this probe pushes K to 10 to test whether the
+    # disagreement signal benefits from a larger ensemble. Expensive (K=10
+    # roughly 2.5× the per-step critic cost vs K=4); kept as a lowest-
+    # priority variant in the queue.
+    "large_ensemble": {
+        "num_critics": 10,
+    },
 }
 
 
@@ -155,6 +182,15 @@ def main() -> int:
         f"[ablation] {args.env}/{args.variant}: best trial={best.number} "
         f"score={best.value:.2f}  override={override}"
     )
+
+    # ``edge_qa_with_curriculum`` needs the env's episode length injected
+    # at dispatch time (it's not in ABLATION_VARIANTS because it's
+    # env-specific). Pop the marker and replace with the actual int.
+    if override.pop("__needs_episode_length", False):
+        from sac_hyperparam_search import _ENV_EPISODE_LENGTH
+        ep_len = _ENV_EPISODE_LENGTH.get(args.env, 1000)
+        override["jsrl_episode_length"] = int(ep_len)
+        print(f"[ablation] injected jsrl_episode_length={ep_len} from env")
 
     # ``random_expert`` is special: instead of overriding a method_kwarg,
     # it swaps the expert_policy passed to build_agent_and_train. We keep

@@ -165,7 +165,7 @@ ABLATION_VARIANTS: List[str] = [
     # Preprocessing
     "no_state_aug",
     "no_obs_norm",
-    # Critic target / bootstrap
+    # Critic target / bootstrap (edge-qa + IBRL-style bootstrap)
     "bootstrap_argmax",
     "bootstrap_lcb_gated",
     # Expert quality
@@ -173,7 +173,12 @@ ABLATION_VARIANTS: List[str] = [
     # Off-policy correctness
     "store_policy_action",
     # Orthogonal augmentation: tt-prefill on top of edge-qa
-    "expert_prefill",
+    # Compositionality: edge-qa + JSRL-curriculum
+    "edge_qa_with_curriculum",
+    # Pessimism axis discrete: β = 0 with softmax gate retained
+    "no_pessimism",
+    # Ensemble probe (lowest priority: K=10 is ~2.5x critic cost)
+    "large_ensemble",
 ]
 # Envs the ablation study runs on, in order of priority (P3DCircle first).
 # Switched away from FourTank: per the SAC vs IBRL one-sided permutation test
@@ -193,6 +198,14 @@ GPU_CHECK_RETRY_S = 60
 ROOT = Path(__file__).resolve().parent
 HP_RESULTS = ROOT / "hp_results"
 DEGRADATION_RESULTS = ROOT / "degradation_results"
+# v2 deployment-side perturbations (action_bias, obs_noise). Source of truth
+# for these intensity sweeps lives in run_degradation_study_v2.py:INTENSITIES;
+# duplicated here for the --status display only.
+DEGRADATION_V2_RESULTS = ROOT / "degradation_v2_results"
+V2_DEGRADATION_INTENSITIES = {
+    "action_bias": [0.10, 0.25, 0.50],
+    "obs_noise":   [0.05, 0.15, 0.30],
+}
 ABLATION_RESULTS = ROOT / "ablation_results"
 LOG_DIR = ROOT / "study_logs"
 GPU_CHECK = ROOT / "GPU_check.sh"
@@ -847,6 +860,20 @@ def _degradation_done(env: str, method: str, sigma: float) -> bool:
     return p.exists()
 
 
+def _degradation_v2_done(env: str, method: str, deg_type: str,
+                         intensity: float) -> bool:
+    """True iff the v2 cell's output JSON exists locally.
+
+    Path matches run_degradation_v2.py's writer: filenames use the float
+    repr of intensity (so 0.10 → '0.1', 0.50 → '0.5', 0.05 → '0.05').
+    """
+    tag = f"{float(intensity)}"
+    p = DEGRADATION_V2_RESULTS / (
+        f"{env.lower()}__{method}__{deg_type}__{tag}.json"
+    )
+    return p.exists()
+
+
 def _ablation_done(env: str, variant: str) -> bool:
     p = ABLATION_RESULTS / f"{env.lower()}__{variant}.json"
     return p.exists()
@@ -883,20 +910,45 @@ def _unit_priority(kind: str, env: str, method: str,
               method_rank * 10 + sigma_rank.
     """
     if kind == "ablation":
-        env_rank = ABLATION_ENVS.index(env)
+        # User directive: ablations on P3DC + CheetahRun must complete BEFORE
+        # the BarkourJoystick + Plane3DFigureEight HPO sweep starts.
+        # Encoding: slot ablations between GF (env_rank=3) and BarkourJoystick
+        # (env_rank=4) in the primary tier, so they take priority over those
+        # two envs but defer to in-flight P3DC/Cheetah/FT/GF HPO+degradation.
+        env_rank_in_abl_set = ABLATION_ENVS.index(env)  # 0 P3DC, 1 Cheetah
         var_rank = ABLATION_VARIANTS.index(variant) if variant else 0
-        return _ABLATION_TIER * 10_000_000 + env_rank * 100_000 + var_rank
+        return (
+            _PRIMARY_TIER * 10_000_000
+            + 350_000  # between GF (300_000) and BarkourJoystick (400_000)
+            + env_rank_in_abl_set * 1_000
+            + var_rank
+        )
     env_rank = ENVS.index(env)
     method_rank = METHODS.index(method)
     sigma_rank = (
         DEGRADATION_SIGMAS.index(sigma) if sigma is not None else 0
     )
     tier = _EDGE_TIER if method == "edge" else _PRIMARY_TIER
-    phase = 0 if kind == "hpo" else 1  # within-env: HPO before degradation
+    # User directive: v1 mistune degradation for sac_quality_aware + residual
+    # runs BEFORE ablations; mistune for the other expert methods runs AFTER
+    # ablations. Encoded by splitting the degradation phase offset:
+    #   - high-pri methods: phase_offset 10_000 (lands at env_rank*100k + 10k)
+    #     => GF lands at 310_000-310_059, before ablations at 350_000+
+    #   - low-pri methods:  phase_offset 60_000 (lands at env_rank*100k + 60k)
+    #     => GF lands at 360_000+, after ablations at 350_000+
+    # HPO stays at phase_offset 0 (always first within env).
+    if kind == "hpo":
+        phase_offset = 0
+    else:
+        # kind == "degradation"
+        if method in ("sac_quality_aware", "residual"):
+            phase_offset = 10_000
+        else:
+            phase_offset = 60_000
     return (
         tier * 10_000_000
         + env_rank * 100_000
-        + phase * 10_000
+        + phase_offset
         + method_rank * 10
         + sigma_rank
     )
@@ -1717,11 +1769,15 @@ def print_status() -> None:
         if key[0] == "ablation":
             abl_running_by_env[key[1]] = abl_running_by_env.get(key[1], 0) + 1
 
+    # DEG columns: v1 mistune (existing param-perturbation sweep) +
+    # v2 action_bias + v2 obs_noise. Each shows 'done/total' and an optional
+    # '+Nr' suffix for cells currently running.
     print(
         f"{'env':<20} {'method':<10} {'HPO':<44} "
-        f"{'p1 bias (n/N)':>16} {'p2 bias (n/N)':>16} {'p3 bias':>10} {'DEG':<8}"
+        f"{'p1 bias (n/N)':>16} {'p2 bias (n/N)':>16} {'p3 bias':>10} "
+        f"{'mistune':<8} {'a-bias':<8} {'obs':<8}"
     )
-    print("-" * 130)
+    print("-" * 145)
     n_hpo_done = n_deg_done = 0
     n_hpo_total = n_deg_total = 0
     total_remaining_sec = 0  # sum of remaining time across all pending/running units
@@ -1821,8 +1877,9 @@ def print_status() -> None:
             p2_str = _fmt(p2_best, n_p2, HPO_TOP_K)
             # Phase 3 is always a single top-1 rerun, no count needed.
             p3_str = _fmt(p3_best, n_p3, 1, show_count=False)
-            # DEG column (expert-using methods only)
+            # DEG columns (expert-using methods only): v1 mistune + v2 bias + v2 obs.
             if method in ("edge", "sac_quality_aware", "ibrl", "jsrl", "jsrl_curriculum", "residual"):
+                # v1 mistune (existing param-perturbation sweep)
                 deg_done = sum(
                     _degradation_done(env, method, s) for s in DEGRADATION_SIGMAS
                 )
@@ -1830,19 +1887,33 @@ def print_status() -> None:
                     1 for s in DEGRADATION_SIGMAS
                     if (env, method, str(s)) in deg_running
                 )
-                deg_str = f"{deg_done}/{len(DEGRADATION_SIGMAS)}"
+                v1_str = f"{deg_done}/{len(DEGRADATION_SIGMAS)}"
                 if running_sigs:
-                    deg_str += f"+{running_sigs}r"
+                    v1_str += f"+{running_sigs}r"
                 n_deg_total += len(DEGRADATION_SIGMAS)
                 n_deg_done += deg_done
                 deg_remaining = len(DEGRADATION_SIGMAS) - deg_done
                 total_remaining_sec += deg_remaining * _final_sec_for(env)
+
+                # v2 action_bias / obs_noise. No "running" annotation: the v2
+                # orchestrator (run_degradation_study_v2.py) is typically off-host
+                # and ``ps`` here doesn't see its workers.
+                v2_strs = []
+                for dtype in ("action_bias", "obs_noise"):
+                    intensities = V2_DEGRADATION_INTENSITIES[dtype]
+                    done = sum(
+                        _degradation_v2_done(env, method, dtype, i)
+                        for i in intensities
+                    )
+                    v2_strs.append(f"{done}/{len(intensities)}")
             else:
-                deg_str = "n/a"
+                v1_str = "n/a"
+                v2_strs = ["n/a", "n/a"]
             disp = _METHOD_DISPLAY.get(method, method)
             print(
                 f"{env:<20} {disp:<10} {hpo_str:<44} "
-                f"{p1_str:>16} {p2_str:>16} {p3_str:>10} {deg_str:<8}"
+                f"{p1_str:>16} {p2_str:>16} {p3_str:>10} "
+                f"{v1_str:<8} {v2_strs[0]:<8} {v2_strs[1]:<8}"
             )
             n_hpo_total += 1
             n_hpo_done += int(hpo_done)
