@@ -1,0 +1,6 @@
+{
+  "deferred": true,
+  "metric": 0.0,
+  "note": "barkourjoystick HPO deferred; not used in current paper. Barrier file to make orchestrator skip; do not interpret as a real result.",
+  "warm_start_status": "deferred"
+}

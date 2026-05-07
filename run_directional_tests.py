@@ -128,25 +128,28 @@ def per_seed_phase3(env: str, method: str) -> List[float]:
 def per_seed_degradation_v1(env_lc: str, method: str, sigma: float) -> List[float]:
     """Per-seed trailing means for v1 (mistune) degradation runs.
 
-    The degradation pipeline writes TB under `tensorboard/<run_id>/` (run_full_study /
-    degradation_eval). The result JSON does NOT preserve run_ids, so we have to
-    rediscover the per-seed TB events: by convention they live alongside the
-    last evaluation cycle. Best-effort: scan tensorboard/ for the most recent
-    cluster of 50 run dirs that match this env/method/sigma cell.
-
-    Since this is heuristic, we also fall back to a more reliable path: each
-    degradation v1 result JSON typically has a `run_ids` field if logged. Try
-    that first.
+    Current run_degradation_eval.py writes the per-seed final-window
+    means directly into the JSON as ``per_seed_metric``. We use that
+    when available; otherwise we fall back to TB-event extraction via
+    ``run_ids`` (which a re-run of the cell will produce).
     """
     payload_path = DEGRADATION_RESULTS / f"{env_lc}__{method}__sigma{sigma}.json"
     if not payload_path.is_file():
         raise FileNotFoundError(payload_path)
     payload = json.loads(payload_path.read_text())
+    per_seed = payload.get("per_seed_metric")
+    if per_seed:
+        means = [float(x) for x in per_seed if x is not None]
+        if not means:
+            raise ValueError(
+                f"per_seed_metric in {payload_path} is all None; re-run the cell."
+            )
+        return means
     run_ids = payload.get("run_ids", [])
     if not run_ids:
         raise ValueError(
-            f"degradation v1 result {payload_path} has no run_ids; "
-            f"per-seed extraction not possible from JSON alone."
+            f"degradation v1 result {payload_path} has no per_seed_metric "
+            f"and no run_ids; re-run with current run_degradation_eval.py."
         )
     tb_root = ROOT / "tensorboard"
     means: List[float] = []
@@ -236,7 +239,7 @@ def main() -> int:
     print("Loading per-seed trailing means from TB events...")
     print(f"Window: last {WINDOW_STEPS // 1000}k steps; {N_PERMUTATIONS:,} permutations")
 
-    # F1: IBRL < SAC on FourTank.
+    # F1: IBRL < SAC on FourTank, replicated on GlassFurnace.
     print("\nF1 setup: IBRL < SAC on FourTank")
     try:
         ibrl_ft = np.array(per_seed_phase3("fourtank", "ibrl"))
@@ -247,13 +250,31 @@ def main() -> int:
         print(f"  [skip] F1: {e}")
         f1 = None
 
-    # F2: Residual < JSRL-training-time on Plane3DCircle.
-    print("\nF2 setup: Residual SAC < JSRL-training-time on Plane3DCircle")
+    # F1 replication on GlassFurnace: IBRL < SAC, both at near-ceiling
+    # expert. Per reviewer W2: a second F1 anchor.
+    print("\nF1 setup: IBRL < SAC on GlassFurnace")
+    try:
+        ibrl_gf = np.array(per_seed_phase3("glassfurnace", "ibrl"))
+        sac_gf = np.array(per_seed_phase3("glassfurnace", "sac"))
+        f1_gf = one_sided_perm_test(ibrl_gf, sac_gf, alternative="less")
+        report("F1: IBRL < SAC, GlassFurnace", f1_gf)
+    except Exception as e:
+        print(f"  [skip] F1 GF: {e}")
+        f1_gf = None
+
+    # F2: Residual < {JSRL-tt, IBRL, EDGE} on Plane3DCircle.
+    # JSRL-tt is the strongest expert-using alternative; IBRL and EDGE
+    # confirm the saturation against two more baselines.
+    print("\nF2 setup: Residual SAC < {JSRL-tt, IBRL, EDGE} on Plane3DCircle")
+    f2 = {}
     try:
         res_p3d = np.array(per_seed_phase3("plane3dcircle", "residual"))
-        jsrltt_p3d = np.array(per_seed_phase3("plane3dcircle", "jsrl"))
-        f2 = one_sided_perm_test(res_p3d, jsrltt_p3d, alternative="less")
-        report("F2: Residual < JSRL-tt, P3DC", f2)
+        for opp_method, opp_label in [("jsrl", "JSRL-tt"), ("ibrl", "IBRL"),
+                                      ("sac_quality_aware", "EDGE")]:
+            opp = np.array(per_seed_phase3("plane3dcircle", opp_method))
+            r = one_sided_perm_test(res_p3d, opp, alternative="less")
+            report(f"F2: Residual < {opp_label}, P3DC", r)
+            f2[opp_label] = r
     except Exception as e:
         print(f"  [skip] F2: {e}")
         f2 = None
@@ -270,7 +291,7 @@ def main() -> int:
         f3 = None
 
     # Save summary
-    out = {"F1": f1, "F2": f2, "F3": f3}
+    out = {"F1": f1, "F1_GF": f1_gf, "F2": f2, "F3": f3}
     out_path = ROOT / "directional_test_results.json"
     out_path.write_text(json.dumps(out, indent=2))
     print(f"\nWrote {out_path}")

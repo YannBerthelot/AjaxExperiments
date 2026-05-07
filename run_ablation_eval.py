@@ -118,6 +118,48 @@ ABLATION_VARIANTS: dict = {
     "large_ensemble": {
         "num_critics": 10,
     },
+    # ──────── Bandit view: literal Thompson sampling vs LCB gate ────────
+    # Replace EDGE's LCB-softmax gate with literal Gaussian-parametric
+    # Thompson sampling on the (μ, σ) of the small critic ensemble:
+    # q̃_e ∼ N(μ_e, (T σ_e)^2), q̃_p ∼ N(μ_p, (T σ_p)^2), pick whichever
+    # is larger. Tests the paper's claim that the under-dispersion of
+    # small ensembles (N ∈ {2, 4}) makes literal TS collapse toward
+    # greedy and that EDGE's fixed-bandwidth Gaussian approximation
+    # (with τ compensating for under-dispersion) actually helps.
+    "literal_thompson": {
+        "exploration_lcb": False,
+        "exploration_thompson": True,
+        "exploration_argmax": False,
+    },
+    # ──────── 2x2 corner: (argmax gate) x (LCB scoring) ────────
+    # Closes the (argmax, LCB) cell of the gating-form x scoring-rule
+    # 2x2. Keeps EDGE's LCB scoring (mu - beta*sigma) and replaces the
+    # softmax sampling with a deterministic argmax. Together with
+    # gating_argmax (argmax + min-Q), no_pessimism (softmax + min-Q,
+    # via beta=0), and EDGE default (softmax + LCB), this fills the
+    # remaining corner.
+    "argmax_lcb": {
+        "exploration_argmax_lcb": True,
+    },
+    # ──────── Mechanistic: literal TS + 10-critic ensemble ────────
+    # Literal Gaussian-parametric Thompson sampling, but with K=10
+    # critics instead of EDGE's HPO-tuned K in {2,4}. The bandit-view
+    # claim is that small ensembles under-disperse so literal TS
+    # collapses to greedy; if true, K=10 should narrow or close the
+    # gap to EDGE's softmax-LCB gate. Direct mechanistic test of the
+    # under-dispersion claim made in §4 / discussed in app:ablation.
+    "literal_thompson_k10": {
+        "exploration_lcb": False,
+        "exploration_thompson": True,
+        "exploration_argmax": False,
+        "num_critics": 10,
+    },
+    # ──────── Diagnostic: empty override (EDGE default config) ────────
+    # Re-runs EDGE at the tuned hyperparameters with no method_kwarg
+    # changes. Used to collect the p_expert_max telemetry (Coverage
+    # Lemma diagnostic) without altering the gate. The result IQM
+    # should match the existing EDGE proxy bar to within seed noise.
+    "edge_default_probe": {},
 }
 
 
@@ -209,16 +251,22 @@ def main() -> int:
         print(f"[ablation] random_expert: swapped expert with RandomScrambledExpert")
 
     seeds = list(range(args.n_seeds))
-    ckpt_path = (
-        CHECKPOINT_DIR / f"ablation__{args.env.lower()}__{args.variant}.pkl"
-    )
+    # Skip the ablation-checkpoint pickle: build_agent_and_train calls
+    # ajax.save_checkpoint -> jax.tree.map(np.asarray, state) at the end,
+    # which trips a TracerArrayConversionError on CheetahRun (one leaf of
+    # the agent state escapes the vmap as a BatchTracer; harmless for the
+    # in-process result but unsafe to materialize). The checkpoint is only
+    # used for cross-process resume, which the ablation pipeline never
+    # does (single 300k-step run), so passing checkpoint_path=None is the
+    # least-invasive fix; the per-seed metrics we report come from
+    # read_final_metric over TB events, not the checkpoint.
     final_state, run_ids, tb_folder = build_agent_and_train(
         env_name=args.env,
         method=method,
         best_params=best.params,
         seed_list=seeds,
         n_timesteps=args.n_timesteps,
-        checkpoint_path=str(ckpt_path),
+        checkpoint_path=None,
         method_kwargs_override=override,
         expert_override=expert_override,
     )

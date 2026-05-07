@@ -94,9 +94,19 @@ def _sig_marker(p: float) -> str:
 def _fmt_iqm(v: float) -> str:
     if not np.isfinite(v):
         return "TBD"
+    # Reference (SAC) IQM is signed only when negative; pad unsigned
+    # values with a phantom + so they align with the +/- prefixes in
+    # the other rows.
     if abs(v) >= 1000:
-        return f"{v:,.0f}".replace(",", "{,}")
-    return f"{v:,.1f}".replace(",", "{,}")
+        body = f"{v:,.0f}".replace(",", "{,}")
+    else:
+        body = f"{v:,.1f}".replace(",", "{,}")
+    if not body.startswith("-"):
+        body = "\\phantom{+}" + body
+    else:
+        # use proper math minus for visual parity with $-$X\% rows
+        body = "$-$" + body[1:]
+    return body
 
 
 def _fmt_delta_pct(d: float) -> str:
@@ -152,7 +162,7 @@ def main() -> int:
     out = OUT_DIR / "main_perenv.tex"
     lines: list[str] = []
     n_envs = len(ENVS)
-    col_spec = "l" + "r" * n_envs
+    col_spec = "l" + "l" * n_envs
     lines.append(f"\\begin{{tabular}}{{{col_spec}}}")
     lines.append("\\toprule")
     lines.append(
@@ -171,21 +181,17 @@ def main() -> int:
                 continue
             iqm_str = _fmt_iqm(iqm)
             if m_key == REFERENCE:
-                # Reference (SAC) row: show raw IQM as the absolute anchor.
+                # Reference (SAC) row: raw IQM only.
                 disp = iqm_str
             else:
-                # Non-reference rows: show only Δ% vs SAC + significance
-                # marker. CI brackets and raw IQM dropped to reduce
-                # visual clutter.
-                d = r.get("delta_pct", np.nan)
+                # Non-reference rows: raw IQM + significance marker (vs
+                # SAC, Holm-Bonferroni-corrected within env). Δ% removed
+                # because on Plane3DCircle SAC is negative and
+                # Δ% = (J - J_SAC) / |J_SAC| × 100 reads as a
+                # spurious "+250%" on what is really a sign reversal.
                 p_corr = r.get("p_corr", np.nan)
-                if np.isfinite(d):
-                    disp = (
-                        f"{_fmt_delta_pct(d)}"
-                        f"{_sig_marker(p_corr) if np.isfinite(p_corr) else ''}"
-                    )
-                else:
-                    disp = iqm_str
+                marker = _sig_marker(p_corr) if np.isfinite(p_corr) else ""
+                disp = f"{iqm_str}{marker}"
             cells.append(disp)
         bold = "\\textbf{" + m_disp + "}" if m_key == PROPOSED else m_disp
         if m_key == PROPOSED:

@@ -4631,10 +4631,13 @@ def _paper_render_degradation_bars(
 
 
 def _paper_render_ablation_bar(env: str) -> Optional[Path]:
-    """Per-env ablation bar chart for the EDGE design ablations."""
+    """Per-env ablation bar chart matching the rliable horizontal style of
+    ``_paper_render_per_env_headline``: methods on y-axis, IQM tick on
+    x-axis, EDGE (the reference) highlighted in green at the top, variants
+    sorted by IQM descending in grey, expert as a vertical dotted line."""
+    _paper_apply_style()
     env_slug = env.lower()
-    rows = []
-    # Reference: edge-qa final score on this env (no ablation).
+    rows: list[tuple[str, float]] = []
     qa_sel = _paper_best_trial_tb(env_slug, "sac_quality_aware")
     if qa_sel is not None:
         qa_tb, qa_run_ids = qa_sel
@@ -4647,7 +4650,6 @@ def _paper_render_ablation_bar(env: str) -> Optional[Path]:
             mask = steps >= max(0, last_step - 200_000)
             window = values[mask]
             rows.append(("EDGE (full)", float(_iqm(window).mean())))
-    # Variants
     for f in sorted(_PAPER_ABL_DIR.glob(f"{env_slug}__*.json")):
         variant = f.stem.split("__", 1)[1]
         with open(f) as fh:
@@ -4655,25 +4657,50 @@ def _paper_render_ablation_bar(env: str) -> Optional[Path]:
         metric = payload.get("final_metric") or payload.get("best_hpo_score")
         if metric is None:
             continue
-        rows.append((variant, float(metric)))
+        # Pretty variant label: replace _ with space, keep original token.
+        rows.append((variant.replace("_", " "), float(metric)))
     if not rows:
         return None
-    fig, ax = plt.subplots(figsize=(8, 4.5))
+    # Order: reference first, then variants sorted by IQM descending.
+    if rows[0][0] == "EDGE (full)":
+        ref, variants = rows[0], rows[1:]
+        variants_sorted = sorted(variants, key=lambda r: -r[1])
+        rows = [ref] + variants_sorted
+
     labels = [r[0] for r in rows]
     values = [r[1] for r in rows]
-    bars = ax.bar(labels, values, color=["tab:green"] + ["tab:gray"] * (len(labels) - 1))
-    for bar, v in zip(bars, values):
-        ax.text(bar.get_x() + bar.get_width() / 2, v,
-                f"{v:.0f}", ha="center", va="bottom", fontsize=9)
+    n = len(rows)
+    fig, ax = plt.subplots(figsize=(7.0, 0.32 * n + 1.0))
+    y = np.arange(n)
+    bar_h = 0.50
+    for i, (label, v) in enumerate(rows):
+        is_ref = (label == "EDGE (full)")
+        color = "#2ECC71" if is_ref else "#9aa0a6"
+        alpha = 0.85 if is_ref else 0.55
+        ax.fill_betweenx(
+            [i - bar_h / 2, i + bar_h / 2], 0, v,
+            color=color, alpha=alpha, linewidth=0,
+        )
+        ax.plot([v, v], [i - bar_h / 2, i + bar_h / 2],
+                color=color, linewidth=2.4, solid_capstyle="butt")
+    ax.set_yticks(y)
+    ax.set_yticklabels(
+        [(f"$\\mathbf{{{lab}}}$" if lab == "EDGE (full)" else lab)
+         for lab in labels],
+        fontsize=10,
+    )
+    ax.invert_yaxis()
+    ax.tick_params(axis="y", length=0)
+    ax.tick_params(axis="x", labelsize=9)
+    ax.spines[["top", "right"]].set_visible(False)
+    ax.grid(axis="x", linestyle="--", linewidth=0.4, alpha=0.5)
     expert = _PAPER_EXPERT.get(env)
     if expert is not None:
-        ax.axhline(expert, color="tab:red", ls=":", lw=1.0,
+        ax.axvline(expert, color="#C0392B", ls=":", lw=1.1, alpha=0.9,
                    label=f"expert = {expert:.0f}")
-    ax.set_ylabel("final eval reward")
-    ax.set_title(f"{env} — EDGE design ablations")
-    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
-    ax.grid(axis="y", alpha=0.3)
-    ax.legend(loc="lower right", fontsize=9, frameon=False)
+        ax.legend(loc="lower right", fontsize=9, frameon=False)
+    ax.set_xlabel("IQM final return", fontsize=10)
+    ax.set_title(f"{env} — EDGE design ablations", fontsize=11, pad=4)
     _PAPER_OUT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = _PAPER_OUT_DIR / f"ablation_{env_slug}.pdf"
     plt.tight_layout()
@@ -5474,14 +5501,33 @@ def _paper_render_per_env_headline(
         y = np.arange(n)
         bar_h = 0.34
         iqm_lw = 2.4
+        # Determine the visible xlim BEFORE drawing so arrow tips can
+        # use it. With ``x_window`` (off-canvas threshold), auto-zoom
+        # to the on-canvas methods only; without it, auto-zoom to all.
+        if x_window is not None:
+            on_canvas_items = [
+                r for r in items
+                if x_window[0] <= r[1] <= x_window[1]
+            ]
+            if on_canvas_items:
+                qs = ([r[2] for r in on_canvas_items]
+                      + [r[3] for r in on_canvas_items])
+                xs_lo, xs_hi = min(qs), max(qs)
+            else:
+                xs_lo, xs_hi = x_window
+        else:
+            qs = [r[2] for r in items] + [r[3] for r in items]
+            xs_lo, xs_hi = min(qs), max(qs)
+        pad = max((xs_hi - xs_lo) * 0.10, 1e-6)
+        view_lo, view_hi = xs_lo - pad, xs_hi + pad
         for i, (label, iqm, q1, q3, color, is_prop) in enumerate(items):
             on_canvas = (
                 x_window is None
                 or (x_window[0] <= iqm <= x_window[1])
             )
             if on_canvas:
-                qlo = max(q1, x_window[0]) if x_window else q1
-                qhi = min(q3, x_window[1]) if x_window else q3
+                qlo = max(q1, view_lo)
+                qhi = min(q3, view_hi)
                 ax.fill_betweenx(
                     [i - bar_h, i + bar_h], qlo, qhi,
                     color=color, alpha=0.40 if is_prop else 0.22,
@@ -5493,14 +5539,15 @@ def _paper_render_per_env_headline(
                 ax.plot([iqm, iqm], [i - bar_h, i + bar_h],
                         color=color, linewidth=iqm_lw, solid_capstyle="butt")
             else:
-                # Off-canvas: left arrow if iqm < window, right arrow if >.
-                arrow_dx = 0.04 * (x_window[1] - x_window[0])
+                # Off-canvas: arrow at the visible edge, not the
+                # censor threshold.
+                arrow_dx = 0.04 * (view_hi - view_lo)
                 if iqm < x_window[0]:
-                    edge_x = x_window[0]
+                    edge_x = view_lo
                     tip_x, base_x = edge_x, edge_x + arrow_dx
                     text_x, text_ha = edge_x + arrow_dx * 1.4, "left"
                 else:
-                    edge_x = x_window[1]
+                    edge_x = view_hi
                     tip_x, base_x = edge_x, edge_x - arrow_dx
                     text_x, text_ha = edge_x - arrow_dx * 1.4, "right"
                 ax.annotate(
@@ -5535,16 +5582,7 @@ def _paper_render_per_env_headline(
         ax.spines[["top", "right"]].set_visible(False)
         ax.grid(axis="x", linestyle="--", linewidth=0.4, alpha=0.5)
         ax.set_title(env, fontsize=12, pad=4)
-        if x_window is not None:
-            ax.set_xlim(*x_window)
-        else:
-            # Auto-zoom on visible data with a small pad. Don't force
-            # 0 into the range — when all methods sit far from expert
-            # parity, including 0 squashes the bars.
-            qs = [r[2] for r in items] + [r[3] for r in items]
-            xs_lo, xs_hi = min(qs), max(qs)
-            pad = max((xs_hi - xs_lo) * 0.10, 1e-6)
-            ax.set_xlim(xs_lo - pad, xs_hi + pad)
+        ax.set_xlim(view_lo, view_hi)
         # Mark expert parity only if it lands inside the visible window.
         if metric in {"ena", "raw_advantage"}:
             xlo, xhi = ax.get_xlim()

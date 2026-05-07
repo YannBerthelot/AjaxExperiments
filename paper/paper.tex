@@ -15,6 +15,7 @@
 \usepackage{wrapfig}
 \usepackage{enumitem}
 \usepackage{tabularx}
+\usepackage{makecell}
 \usepackage[capitalize,noabbrev]{cleveref}
 % TEMP TEST: alias \cref to \ref to test if cleveref triggers segfault
 % \renewcommand{\cref}[1]{Section~\ref{#1}}
@@ -61,35 +62,34 @@
 \begin{abstract}
 % ============================================================
 
-Many continuous-control problems come with a competent but
-suboptimal off-the-shelf controller (a tuned PID, a hand-designed
-gait). A growing family of methods uses such controllers as
-queryable experts during reinforcement learning, but each method has
-been proposed in isolation, on a different benchmark, without
-imperfect-expert testing. We assemble the comparison on a shared SAC
-backbone with common hyperparameter-optimization (HPO) and
-evaluation protocols, $100/50$ seeds per cell on control/locomotion
-tasks, and a degradation sweep covering expert mistuning, action
-bias, and observation noise. The harmonized comparison surfaces
-three mechanism-specific failure modes that single-paper evaluations
-miss: \textbf{(F1)} a critic blind spot under argmax-plus-bootstrap
-that drags IBRL below no-expert SAC on near-ceiling experts;
-\textbf{(F2)} residual saturation when the expert is far from
-optimal, which caps additive-correction methods regardless of
-training budget; and \textbf{(F3)} warm-start buffer poisoning that
-collapses training-time-handoff methods under deployment-time
-expert mistuning. Across the four tasks, \emph{no single
-expert-guided method dominates}: each wins on a specific
-task-structure cell and fails predictably elsewhere. On
-near-ceiling-expert tasks (FourTank, GlassFurnace) no
-query-time-expert method clears the expert at $1\mathrm{M}$ steps,
-delineating a regime in which the entire family does not yet help.
-We turn the surfaced spread into a testable decision rule keyed on
-three pre-training observables (expert quality, task termination,
-expected perturbation type), and introduce \textbf{EDGE}
-(Expert-Driven Guided Exploration), a softmax-over-ensemble-LCB
-design point that closes F1 by construction and ties JSRL-curriculum
-under expert mistuning.
+Many continuous-control problems ship with a competent but
+suboptimal controller (a tuned PID, a hand-designed gait). A
+growing family of methods uses such controllers as queryable
+experts during RL, but each method has been proposed in isolation,
+on a different benchmark, without imperfect-expert testing. We
+harmonize the comparison on a shared SAC backbone, common HPO and
+evaluation protocols, $100/50$ seeds per (env, method), and a
+degradation sweep over expert undertuning, action bias, and
+observation noise. The comparison surfaces three failure modes
+single-paper evaluations miss: \textbf{(F1)} a critic blind spot
+under argmax-plus-bootstrap that drags IBRL below no-expert SAC on
+experts close to the no-expert-RL ceiling (\emph{RL-near-ceiling},
+distinct from the absolute physical ceiling); \textbf{(F2)}
+residual saturation on far-from-optimal experts; and \textbf{(F3)}
+warm-start buffer poisoning that collapses training-time-handoff
+methods under deployment-time expert undertuning. \emph{No single
+method dominates}: each wins on one task-structure regime and
+fails predictably elsewhere; on RL-near-ceiling experts (FourTank,
+GlassFurnace) no query-time method clears the expert within our
+$1\mathrm{M}$-step budget, leaving open whether this is a
+fundamental wall or a budget effect. We convert the spread into a
+testable decision rule keyed on three pre-training observables
+(expert quality, task termination, perturbation type). The
+benchmark, taxonomy, and decision rule are the primary
+contribution; we additionally describe \textbf{EDGE}, a
+softmax-over-ensemble-LCB design point used to demonstrate that
+both axes the taxonomy points to (gate form, scoring rule) are
+individually exploitable.
 
 
 \end{abstract}
@@ -99,39 +99,43 @@ under expert mistuning.
 \label{sec:intro}
 % ============================================================
 
-Industrial control, locomotion, and trajectory-tracking tasks rarely
-ship without a working baseline. The shipped controller is typically
-a hand-engineered feedback law
-(proportional-integral-derivative, PID; linear-quadratic regulator,
-LQR; model-predictive control, MPC), a motion planner, a pattern
-generator, or a behavior-cloned policy. Such experts encode
-useful knowledge but are rarely optimal, and they are typically tuned
-on a nominal model that does not match the deployed system: the
-sim-to-real gap and modeling error make the shipped controller a
-non-trivial floor that RL is asked to surpass. The practitioner's
-question is therefore not \emph{whether} such an expert can help RL,
-but \emph{how}: which integration mechanism extracts the most value
-from a given expert on a given task, and under what failure modes.
+Industrial control, locomotion, and trajectory-tracking tasks
+rarely ship without a working baseline: a hand-engineered feedback
+law (PID \citep{astrom2005amigo}, LQR \citep{kalman1960lqr},
+MPC \citep{rawlings2017mpc}), a motion planner, a central pattern
+generator (CPG \citep{ijspeert2008cpg}), or a behavior-cloned
+policy. These experts encode useful knowledge but are rarely
+optimal, and they are typically tuned on a nominal model that does
+not match the deployed system: the sim-to-real gap and modeling
+error make the shipped controller a non-trivial floor that RL is
+asked to surpass. The practitioner's question is therefore not
+\emph{whether} such an expert can help RL, but \emph{how}: which
+integration mechanism extracts the most value from it, and under
+what failure modes.
 
 Each query-time-expert method (IBRL \citep{hu2023ibrl}, the JSRL
 family \citep{uchendu2023jsrl}, Residual SAC
-\citep{johannink2019residual}; we discuss families and adjacent
-offline-demonstration methods in \cref{sec:related}) was proposed
-in a separate paper, on a different benchmark, against a different
-expert, under a different evaluation procedure. Two gaps follow for a
-practitioner choosing among them: no head-to-head comparison exists
-on a common protocol, and robustness to expert imperfection (the
-natural deployment concern, since the expert one ships with is
-rarely the expert one trained against) is sparsely studied. Our
-contributions address both gaps directly.
+\citep{johannink2019residual}, offline-demonstration relatives in
+\cref{sec:related}) was proposed in isolation, on a different
+benchmark, against a different expert. Two gaps follow for a
+practitioner choosing among them: no head-to-head comparison on a
+common protocol, and sparse coverage of robustness to expert
+imperfection. We address both.
+
+\newpage
 
 \textbf{Contributions.}
 \begin{itemize}[leftmargin=1.2em,itemsep=2pt,topsep=2pt]
 \item A common-protocol benchmark of five expert-guided methods
 (IBRL, two JSRL variants, Residual SAC, EDGE) on four tasks, with a
-shared SAC backbone, shared HPO, $100$ seeds per cell on control
-tasks and $50$ on locomotion, and a degradation sweep covering
-expert mistuning, action bias, and observation noise.
+shared SAC backbone, shared HPO, $100$ seeds per (env, method) on
+control tasks and $50$ on locomotion, and a degradation sweep
+covering expert undertuning, action bias, and observation noise.
+Two of the four tasks (Plane3DCircle, GlassFurnace) are released
+with this paper as new continuous-control benchmarks; they target
+regimes underrepresented in expert-guided RL evaluations
+(terminating crash dynamics with a structurally inadequate PID,
+and long-horizon thermal MIMO control respectively).
 \item Three mechanism-specific failure modes (F1--F3,
 Section~\ref{sec:failuremodes}) predicting which method fails on
 which task structure; F1 and F3 only become visible after
@@ -140,10 +144,12 @@ harmonization.
 (Section~\ref{sec:when-to-use}) mapping termination, expert quality,
 and expected deployment perturbation to a method choice, framed as
 testable guidance.
-\item EDGE, a quality-aware pessimism-gated mixing method introduced
-to probe the gating-form $\times$ pessimism design axes
-(Section~\ref{sec:method}); empirically competitive on every task
-and co-best with JSRL-curriculum under expert mistuning.
+\item Secondarily, \textbf{EDGE}: a quality-aware pessimism-gated
+mixing design point (Section~\ref{sec:method}) showing that the
+two design axes the taxonomy identifies (gate form, scoring rule) are
+each individually exploitable. Competitive on every task and
+co-best with JSRL-curriculum under expert-undertuning, offered as a design
+probe, not a SOTA claim.
 \end{itemize}
 
 % ============================================================
@@ -162,13 +168,15 @@ $\mathcal{S} \subseteq \mathbb{R}^n$, action space
 $\mathcal{A} = [-1,1]^d$, transition function $T: \mathcal{S} \times
 \mathcal{A} \to \mathcal{S}$, and reward $R: \mathcal{S} \times
 \mathcal{A} \to \mathbb{R}$. Alongside the MDP we are given a
-deterministic \emph{expert controller} $\pi^e : \mathcal{S} \to
+deterministic \emph{expert controller} $\pi^{\mathrm{exp}} : \mathcal{S} \to
 \mathcal{A}$, typically a hand-engineered PID, LQR, MPC, or pattern
 generator, that can be queried at any state visited during training.
 The agent's objective is the standard $J(\pi) = \mathbb{E}\left[
 \sum_{t=0}^\infty \gamma^t R(s_t, a_t)\right]$. We denote the
-expert's return as $J_{\mathrm{exp}}$, the RL-only baseline's return at
-convergence as $J_{\mathrm{RL}}$, and the learner as $\pi_\theta$.
+expert's return as $J_{\mathrm{exp}}$, the no-expert SAC baseline's
+return at convergence as $J_{\mathrm{RL}}$ (the best non-expert
+floor on each task in our benchmark, used as the denominator of
+expert-quality below), and the learner as $\pi_\theta$.
 
 \paragraph{Thompson sampling.}
 For a $K$-armed bandit with posterior $p_t(\theta)$ over reward
@@ -191,39 +199,44 @@ aggressively low-uncertainty arms are preferred.
 % ============================================================
 
 \paragraph{Benchmarking expert-guided RL.}
-To our knowledge, no existing benchmark provides a head-to-head
-common-protocol comparison of query-time-expert RL methods. Each
-method we compare was introduced in a separate paper, with
-self-chosen baselines, tasks, expert qualities, and HPO budgets;
-the cross-paper picture is fragmented. The closest adjacent
-benchmarking efforts target different problem settings: D4RL
-\citep{fu2020d4rl} standardizes \emph{offline} RL on fixed
-demonstration datasets; Robomimic \citep{mandlekar2021robomimic}
-benchmarks demo-augmented manipulation, again with fixed
-demonstrations; the rliable framework \citep{agarwal2021rliable}
+No existing benchmark provides a head-to-head common-protocol
+comparison of query-time-expert RL methods. Each method we compare
+was introduced in a separate paper, with self-chosen baselines,
+tasks, expert qualities, and HPO budgets. Adjacent benchmarks
+target different settings: D4RL \citep{fu2020d4rl} and Robomimic
+\citep{mandlekar2021robomimic} standardize \emph{offline} RL on
+fixed demonstration datasets; rliable \citep{agarwal2021rliable}
 supplies aggregation tools (which we adopt) but is not itself a
-benchmark of expert-guided methods. The query-time-expert setting,
-where the expert is a callable controller available at every
-visited state during training, has not been benchmarked under a
-common protocol.
+benchmark of expert-guided methods.
 
 \paragraph{Expert-leveraging methods.}
 We compare three families of query-time expert use: argmax-action
-selection (IBRL \citep{hu2023ibrl}; concurrent DRLR
-\citep{shen2026drlr} adds an expert-buffer-conditioned $Q$-reference
-to address an out-of-distribution-critic concern distinct from F1),
-in-episode handoff with a decaying horizon (JSRL family
-\citep{uchendu2023jsrl}, curriculum and warm-start variants), and
-additive correction (Residual SAC \citep{johannink2019residual}).
-Adjacent families that consume the expert differently are out of
-scope: fixed-trajectory-dataset methods (DAgger
-\citep{ross2011dagger}, AWAC \citep{nair2020awac}, IQL
-\citep{kostrikov2022iql}, PEX \citep{zhang2023pex}, LOGO
-\citep{rengarajan2022logo}) and fixed-offline-buffer methods
-(RLPD \citep{ball2023rlpd}, sampled $50/50$ with the online replay)
-require different fairness conventions (demo-set sampling,
-data-coverage controls); RLPD, the closest bridge, is in
-\cref{app:rlpd}.
+selection (IBRL \citep{hu2023ibrl}; the recent DRLR
+\citep{shen2026drlr} adds a critic-side regularizer on top of
+IBRL, orthogonal to the gate-form vs scoring-rule axes of our
+taxonomy and evaluated on a different task suite, so we do not
+re-run it head-to-head), in-episode handoff with a decaying
+horizon (JSRL family \citep{uchendu2023jsrl}, curriculum and
+warm-start variants), and additive correction (Residual SAC
+\citep{johannink2019residual}).
+Adjacent families consuming a fixed-dataset rather than a callable
+expert (DAgger \citep{ross2011dagger}, AWAC \citep{nair2020awac},
+IQL \citep{kostrikov2022iql}, PEX \citep{zhang2023pex}, LOGO
+\citep{rengarajan2022logo}) need different fairness conventions and
+are out of scope.
+
+\paragraph{Two related-but-not-included neighbors.}
+A \emph{Parameterized-Expert-Policy} baseline (RL actor modulates
+the controller's parameters rather than mixing actions) is
+structurally distinct: its expressiveness is bounded by the
+controller's parametric form (a CPG, even with per-step
+modulation, cannot express arbitrary actuator patterns), so any
+comparison conflates the integration mechanism with a different
+policy class. Seeding such a parameterization from our experts is
+a useful follow-up. \emph{RLPD} \citep{ball2023rlpd} is the
+natural static-buffer comparison; we exclude it as a scoping
+artifact (post-dated our baseline freeze), not for a principled
+reason.
 
 % ============================================================
 \section{Expert-Driven Guided Exploration (EDGE)}
@@ -250,23 +263,23 @@ Formal Remark + Coverage Lemma in \cref{app:proofs}.
 EDGE is a minimal modification to any off-policy actor-critic
 algorithm: it changes only the action-selection rule and the input
 to the actor and critic, leaving the gradient updates untouched.
-\begin{wrapfigure}[22]{r}{0.62\textwidth}
-\vspace{-1.0em}
-\begin{minipage}{0.62\textwidth}
+\begin{wrapfigure}[18]{r}{0.66\textwidth}
+\vspace{-2em}
+\begin{minipage}{0.66\textwidth}
 \begin{algorithm}[H]
 \caption{EDGE. {\color{edgeblue} Blue} = modifications to base SAC.}
 \label{alg:edge}
 \begin{algorithmic}[1]
-\State \textbf{Inputs:} steps $T$, ensemble size $N$, discount $\gamma$, target rate $\rho$;
-{\color{edgeblue} pessimism $\kappa\!\geq\!0$, gate temperature $\tau\!>\!0$; expert $\pi^e$ with internal state $z$.}
+\State \textbf{Inputs:} steps $T$, ensemble size $N$, discount $\gamma$;
+{\color{edgeblue} pessimism $\kappa\!\geq\!0$, gate temperature $\tau\!>\!0$; expert $\pi^{\mathrm{exp}}$ with internal state $z$.}
 \State Init $\pi_\theta$, critics $\{Q_{\phi_n}\}_{n=1}^N$, targets $\{\bar Q_{\bar\phi_n}\}_{n=1}^N$, buffer $\mathcal{B}$.
 \State Reset env to $s_0$; {\color{edgeblue} init expert state $z_0$.}
 \State {\color{edgeblue} $\tilde s_0 \leftarrow [s_0, z_0]$}
 \For{$t = 0, \ldots, T-1$}
     \State {\color{edgeblue} $\check{Q}(\tilde s_t, a) \!=\! \min_n Q_{\phi_n}(\tilde s_t, a) \!-\! \kappa(\max_n Q_{\phi_n} \!-\! \min_n Q_{\phi_n})$}
-    \State {\color{edgeblue} $p_t = \sigma\big((\check{Q}(\tilde s_t, \pi^e(s_t, z_t)) - \check{Q}(\tilde s_t, \pi_\theta(\tilde s_t)))/\tau\big)$}
+    \State {\color{edgeblue} $p_t = \sigma\big((\check{Q}(\tilde s_t, \pi^{\mathrm{exp}}(s_t, z_t)) - \check{Q}(\tilde s_t, \pi_\theta(\tilde s_t)))/\tau\big)$}
     \State {\color{edgeblue} $b_t \sim \mathrm{Bernoulli}(p_t)$}
-    \State $a_t \leftarrow$ {\color{edgeblue}$b_t\,\pi^e(s_t, z_t) + (1-b_t)\,$}$\pi_\theta(\tilde s_t)$
+    \State $a_t \leftarrow$ {\color{edgeblue}$b_t\,\pi^{\mathrm{exp}}(s_t, z_t) + (1-b_t)\,$}$\pi_\theta(\tilde s_t)$
     \State Execute $a_t$; observe $r_t, s_{t+1}$; {\color{edgeblue}update $z_{t+1}$.}
     \State {\color{edgeblue} $\tilde s_{t+1} \leftarrow [s_{t+1}, z_{t+1}]$}
     \State Store $(\tilde s_t, a_t, r_t,$ {\color{edgeblue}$\tilde s_{t+1}$}$)$ in $\mathcal{B}$.
@@ -278,9 +291,14 @@ to the actor and critic, leaving the gradient updates untouched.
 \end{wrapfigure}
 Two pieces compose EDGE: (a) a quality-aware pessimism gate
 that selects between expert and policy at every step, and (b) an
-expert-state augmentation that exposes the expert's internal
-controller state (e.g.\ PID integrator state, CPG phase) to the actor
-and critic. Unlike DAgger \citep{ross2011dagger}, which labels visited states
+expert-state augmentation $[s, z]$ exposing the expert's internal
+controller state (PID integrator state, CPG phase) to actor and
+critic. The augmentation is applied uniformly to every
+expert-using method (IBRL, both JSRL variants, Residual SAC,
+EDGE), as a property of the comparison protocol, not a private
+EDGE knob; the \texttt{no\_state\_aug} ablation
+(\cref{app:ablation}) measures its contribution at fixed protocol.
+Unlike DAgger \citep{ross2011dagger} which labels visited states
 with the expert's action and trains by behavior cloning against those
 labels, our replay tuple records the executed action with its realized
 reward and next state, never the expert's label, so the learner is
@@ -298,31 +316,48 @@ instantiate, so ``EDGE'' refers to ``EDGE on top of SAC'' throughout
 the paper. Concretely, EDGE acts under the expert-mixed behavior
 policy
 \begin{equation}
-    \beta_t(a\mid s) \;=\; p_t(s)\,\delta_{\pi^e(s)}(a)
+    \beta_t(a\mid s) \;=\; p_t(s)\,\delta_{\pi^{\mathrm{exp}}(s)}(a)
     \;+\;(1-p_t(s))\,\pi_\theta(a\mid s),
     \quad
-    p_t(s) \;=\; \sigma\!\Big(\tfrac{\check{Q}_t(s,\pi^e(s)) -
+    p_t(s) \;=\; \sigma\!\Big(\tfrac{\check{Q}_t(s,\pi^{\mathrm{exp}}(s)) -
                               \check{Q}_t(s,\pi_\theta(s))}{\tau}\Big),
     \label{eq:behavior}
 \end{equation}
-where $\delta_{\pi^e(s)}(\cdot)$ is the point mass on the expert
-action $\pi^e(s)$, and $\check{Q}_t(s,a) = Q^{\min}_\phi(s,a) - \kappa\,(Q^{\max}_\phi(s,a)
+where $\sigma(x) = (1 + e^{-x})^{-1}$ is the logistic
+(sigmoid) function, $\delta_{\pi^{\mathrm{exp}}(s)}(\cdot)$ is the point mass on
+the expert action $\pi^{\mathrm{exp}}(s)$ (the expert is assumed deterministic
+per \S2; extension to stochastic experts is straightforward, see
+\cref{app:limitations_extra}), and
+$\check{Q}_t(s,a) = Q^{\min}_\phi(s,a) - \kappa\,(Q^{\max}_\phi(s,a)
 - Q^{\min}_\phi(s,a))$ is the ensemble-pessimistic Q-estimate (the
 critic-ensemble minimum, further penalized by ensemble spread,
 adapting the disagreement signal of offline-RL value penalties
 \citep{an2021edac,ghasemipour2022msg} and ensemble exploration
 \citep{osband2016bootstrappeddqn,lee2021sunrise} to an
-expert-vs-policy mixing decision) and $\sigma$ is the logistic
-function. The replay buffer stores $(s, a, r, s')$
+expert-vs-policy mixing decision). The replay buffer stores
+$(s, a, r, s')$
 tuples with $a \sim \beta_t$; $0 < p_t(s) < 1$ at every state with
 non-degenerate critic disagreement, so the gate preserves full
 support over both arms. Equivalently, the gate is a fixed-bandwidth
 Gaussian approximation to pessimistic Thompson sampling on the
-2-armed $\{\pi^e(s),\pi_\theta(s)\}$ bandit: $\check Q$ replaces the
+2-armed $\{\pi^{\mathrm{exp}}(s),\pi_\theta(s)\}$ bandit: $\check Q$ replaces the
 posterior draw, $\tau$ replaces the sample variance, and the Gaussian
 approximation compensates for the under-dispersion of small critic
 ensembles \citep{osband2016bootstrappeddqn,an2021edac,ghasemipour2022msg}
-that would otherwise collapse a literal sample-based TS to greedy.\label{sec:bandit}
+that would otherwise collapse a literal sample-based TS to greedy.
+The \texttt{literal\_thompson} ablation (\cref{app:ablation})
+replaces the softmax-LCB gate with literal Gaussian-parametric
+Thompson sampling on the same critic ensemble: on Plane3DCircle
+EDGE reaches IQM $\approx 6{,}230$ while literal TS plateaus at
+$\approx 4{,}265$ at $300\mathrm{k}$ steps, $50$ seeds. Scaling the
+critic ensemble to $N{=}10$ leaves the gap essentially unchanged
+($4{,}190$), ruling out under-dispersion as the operative
+mechanism: the load-bearing piece is the pessimism shift
+($-\kappa\sigma$) shared by both arms in LCB scoring, not the
+softmax-vs-Thompson choice. The four-corner sweep over gate form
+and scoring rule reported in \cref{app:ablation} corroborates this:
+swapping min-$Q$ for LCB lifts both gates substantially while
+swapping argmax for softmax adds a smaller increment on top.\label{sec:bandit}
 
 % ============================================================
 \section{Experiments}
@@ -335,10 +370,11 @@ RL methods on a common protocol.
 budget, expert, and seed protocol, which expert-guided method wins on
 which task, and by how much over the no-expert SAC and expert-only
 floors? \textbf{(Q2, failure modes)} Do the predicted failure modes
-F1, F2, F3 actually bind on the cells the taxonomy targets, and are
-they distinguishable from generic underperformance? \textbf{(Q3,
+F1, F2, F3 (defined in \cref{sec:failuremodes}) actually bind on the
+regimes the taxonomy targets, and are they distinguishable from
+generic underperformance? \textbf{(Q3,
 robustness to expert imperfection)} How does each method degrade
-under expert mistuning, action bias, and observation noise; do the
+under expert undertuning, action bias, and observation noise; do the
 clean-protocol rankings reverse? \textbf{(Q4, EDGE design choices)}
 Are the two EDGE modifications (pessimism-gated mixing, expert-state
 augmentation) each necessary, and how sensitive is performance to the
@@ -350,7 +386,7 @@ advantage $\mathrm{ENA} = (J - J_{\mathrm{exp}})/(J_{\mathrm{ref}} -
 J_{\mathrm{exp}})$ (formal definition and per-task $J_{\mathrm{ref}}$
 in \cref{sec:protocol}, \cref{eq:nbias}; sign convention:
 $\mathrm{ENA}\!=\!0$ matches the expert, $\mathrm{ENA}\!=\!1$ matches
-a per-task physical ceiling). Code, per-cell hyperparameters, and raw
+a per-task physical ceiling). Code, per-(env, method) hyperparameters, and raw
 result JSONs are released at anonymous mirrors covering the task
 suite, the RL framework with all five expert-guided methods, and the
 experiment harness (\cref{app:reproducibility}).
@@ -359,18 +395,19 @@ experiment harness (\cref{app:reproducibility}).
 
 \subsubsection{Benchmark Tasks}
 
-Four tasks were chosen to span the cells of the
-expert-quality $\times$ task-structure space that the failure-mode
-taxonomy (\cref{sec:failuremodes}) predicts to bind:
+Four tasks were chosen to span the regions of expert-quality and
+task-structure space that the failure-mode taxonomy
+(\cref{sec:failuremodes}) predicts to bind:
 
 \begin{itemize}[leftmargin=1.3em,itemsep=1pt,topsep=2pt]
 \item \textbf{FourTank} (PID-controlled MIMO setpoint tracking,
 near-MPC-tuned expert): near-ceiling expert, non-terminating; F1-prone.
-\item \textbf{Plane3DCircle} (PID-controlled 3D aircraft trajectory
-tracking, weak expert): terminating with catastrophic failure;
-F2-prone.
-\item \textbf{GlassFurnace} (PID-controlled thermal process, mid-quality
-expert): long thermal horizon, non-terminating; F3-prone.
+\item \textbf{Plane3DCircle (new)} (PID-controlled 3D aircraft
+trajectory tracking, weak expert): terminating with catastrophic
+failure; F2-prone.
+\item \textbf{GlassFurnace (new)} (PID-controlled thermal process,
+mid-quality expert): long thermal horizon, non-terminating;
+F3-prone.
 \item \textbf{CheetahRun}: non-terminating CPG-controlled locomotion
 with a weak open-loop expert.
 \end{itemize}
@@ -391,11 +428,7 @@ large-magnitude observations; full discussion in
 \cref{app:hpo}). \cref{tab:baselines} lists the six methods compared
 in the main body; the equal Optuna \citep{akiba2019optuna} trial
 budget across methods is discussed as a methodological caveat in
-\cref{sec:limitations}. RLPD \citep{ball2023rlpd}
-(static-demo-buffer setting) and a Parameterized-Expert-Policy
-baseline (RL actor modulates the controller's gains on a log scale)
-sit on different design axes and are reported in
-\cref{app:rlpd,app:param} respectively.
+\cref{sec:limitations}.
 
 \begin{table}[h]
 \centering
@@ -406,12 +439,12 @@ sit on different design axes and are reported in
 \toprule
 \textbf{Method} & \textbf{Mechanism} & \textbf{Tested axis vs. EDGE} \\
 \midrule
-SAC \citep{haarnoja2018sac}            & off-policy actor-critic, no expert       & expert vs.\ no expert \\
-Expert                                  & tuned PID / CPG, no RL                   & RL vs.\ controller-only \\
-IBRL \citep{hu2023ibrl}                 & argmax over $\{Q(s,\pi^e),Q(s,\pi_\theta)\}$ + expert bootstrap & argmax vs.\ stochastic gate \\
-JSRL-curriculum \citep{uchendu2023jsrl} & per-episode handoff at in-episode step $H_t$, decayed from the episode horizon to $0$ over training & hard handoff vs.\ stochastic gate \\
-JSRL-training-time                      & expert for first $\rho_{\mathrm{warm}} T$ steps, then policy             & curriculum vs.\ warm-start \\
-Residual SAC \citep{johannink2019residual} & $a = \mathrm{clip}(a^e + a_{\mathrm{res}}, -1, 1)$       & additive vs.\ mixed action \\
+SAC                  & off-policy actor-critic, no expert       & expert vs.\ no expert \\
+Expert               & tuned PID / CPG, no RL                   & RL vs.\ controller-only \\
+IBRL                 & argmax over $\{Q(s,\pi^{\mathrm{exp}}),Q(s,\pi_\theta)\}$ + expert bootstrap & argmax vs.\ stochastic gate \\
+JSRL-curriculum      & \makecell[l]{per-episode handoff at in-episode step $H_t$,\\$H_t$ decayed from episode horizon to $0$ over training} & hard handoff vs.\ stochastic gate \\
+JSRL-training-time (\emph{JSRL-tt}) & expert for first $\rho_{\mathrm{warm}} T$ steps, then policy & curriculum vs.\ warm-start \\
+Residual SAC         & $a = \mathrm{clip}(a^e + a_{\mathrm{res}}, -1, 1)$       & additive vs.\ mixed action \\
 \midrule
 \textbf{EDGE (ours)}                    & pessimism-gated stochastic mixing \eqref{eq:behavior}   & --- \\
 \bottomrule
@@ -433,7 +466,7 @@ floor (PID for setpoint tasks, CPG for locomotion).}
 
 Final phase uses $100$ seeds per configuration on the three control
 tasks and $50$ seeds on CheetahRun.\footnote{Lower CheetahRun seed
-count: parallel-seed throughput is GPU-RAM-bound on the locomotion
+count: parallel-seed throughput is GPU-RAM-bound on the locomotion, due to observation size in the replay buffer.
 task.} Training is $1\mathrm{M}$ environment steps. Per-seed scalars
 are the mean episodic return over the last $200\mathrm{k}$ steps;
 across-seed aggregation is the IQM with $95\%$ stratified bootstrap
@@ -450,7 +483,7 @@ where $J_{\mathrm{exp}}$ is the expert controller's mean return and
 $J_{\mathrm{ref}}$ is a fixed task-specific reference scale equal to
 the per-task episodic-return ceiling (per-step reward upper bound
 times episode length): $10{,}000$ on Plane3DCircle, $500$ on FourTank,
-$6{,}000$ on GlassFurnace (rounded up from the $5{,}760$-step ceiling),
+$5{,}760$ on GlassFurnace,
 $1{,}000$ on CheetahRun. The ceilings are physical upper bounds, not
 empirical scores, and do not depend on any method evaluated in this
 paper. Sign convention: $\mathrm{ENA}=0$ matches the expert,
@@ -466,22 +499,12 @@ expert is a floor (not a target) and the no-expert SAC baseline
 guards against methods whose advantage comes from extra training
 budget rather than expert use.
 
-Statistical analysis has two layers. (1) An \emph{exploratory}
-battery of Mann-Whitney $U$ tests of every method against no-expert
-SAC, with Holm-Bonferroni correction within each environment at
-$\alpha{=}0.05$ (results in \cref{tab:main_perenv}; AUC-permutation
-companion in \cref{app:perenv}). (2) Three \emph{directional}
-confirmations, one per failure mode F1/F2/F3
-(\cref{sec:failuremodes}). The F1 and F2 directional confirmations
-are one-sided permutation tests on per-seed final-window IQM at
-$1\mathrm{M}$ steps ($n{=}50$ per arm, $10^{5}$ shuffles, sign
-predicted by the mechanism); per-seed values are extracted from
-phase3 TB events. The F3 directional confirmation is observational
-(the v1 mistuning pipeline pre-dates per-seed logging) and reported
-as the ratio of JSRL-training-time's fractional drop on the F3
-anchor cell to the next-worst method's drop on the same cell.
-None of the three is pre-registered; each is fixed before running
-the corresponding test by the F-mechanism's directional prediction.
+Statistical analysis has two layers: (1) an exploratory
+Mann-Whitney $U$ battery vs.\ no-expert SAC with Holm-Bonferroni
+correction (\cref{tab:main_perenv}); (2) three directional one-sided
+confirmations of F1/F2/F3, with the sign fixed in advance by the
+mechanism. Full protocols and the F3 caveat are in
+\cref{app:significance,app:directional_tests}.
 
 \subsection{Main Results}
 \label{sec:main-results}
@@ -497,22 +520,30 @@ Residual SAC ties for the top on FourTank (near-ceiling expert, F1
 territory) but collapses on Plane3DCircle (weak expert, F2 territory);
 IBRL is dominated by no-expert SAC on FourTank (one-sided permutation,
 $p{=}0.031$); JSRL-training-time tops Plane3DCircle clean but is the
-most mistuning-fragile method. \cref{tab:main_perenv} reports
-per-method gain over no-expert SAC with significance;
+most undertuning-fragile method. On FourTank and GlassFurnace
+(RL-near-ceiling experts; expert at $98\%$ and $80\%$ of
+$J_{\mathrm{RL}}$ respectively) no expert-using method beats the
+no-expert SAC baseline by more than $\sim$$1\%$ \emph{within our
+$1\mathrm{M}$-step budget}: the contribution from these two tasks
+is \emph{negative}, delineating a regime where the entire
+query-time-expert family does not yet help. We cannot distinguish
+a fundamental wall from a training-budget effect at this horizon;
+longer-horizon runs are a natural follow-up. \cref{tab:main_perenv}
+reports raw per-env IQM with significance vs no-expert SAC;
 \cref{fig:headline} reports the same data on the unified ENA scale.
 
 \paragraph{Sample efficiency.}
-\textbf{Residual SAC reaches near-expert performance instantly on
-near-ceiling-expert tasks}: on FourTank, Residual crosses
-$J\!\geq\!240$ (within $6$ of the expert's $246$) at the first
-evaluation step ($10\mathrm{k}$, $86$/$100$ seeds), while every other
-method needs $700\mathrm{k}{+}$ steps. The same $a_{\mathrm{res}}$
-bound that saturates Residual on weak experts (F2,
-\cref{sec:failuremodes}) collapses to zero correction on a
-near-optimal expert and Residual inherits expert performance for free.
-On Plane3DCircle and CheetahRun, sample-efficiency rankings track the
-asymptote ranking. Per-method first-permanent-crossing curves at
-three reward thresholds per env are in \cref{fig:sample_eff_appendix}.
+On near-ceiling experts, \textbf{Residual SAC inherits the expert at
+no learning cost}: a property of the bound on $a_{\mathrm{res}}$,
+not a learned outcome. The residual correction collapses to near
+zero on a near-optimal expert, so the deployed action matches the
+expert from step zero; on FourTank Residual is at expert-parity
+already at the first evaluation step while other methods need
+hundreds of thousands of steps. The same bound saturates Residual
+on weak experts (F2, \cref{sec:failuremodes}): inheritance and
+saturation are two halves of one bound. Sample-efficiency rankings
+track the asymptote ranking on the other tasks; per-method
+first-permanent-crossing curves are in \cref{fig:sample_eff_appendix}.
 
 \begin{table}[h]
 \centering
@@ -520,13 +551,17 @@ three reward thresholds per env are in \cref{fig:sample_eff_appendix}.
 \renewcommand{\arraystretch}{1.15}
 \input{tables/main_perenv.tex}%
 \caption{Per-env asymptotic IQM final return at $1\mathrm{M}$
-training steps ($100$ seeds for control, $50$ for CheetahRun). The
-SAC row shows the raw IQM (no expert) as the anchor; remaining rows
-show $\Delta\%$ vs SAC with Mann-Whitney $U$ significance markers
-(Holm-Bonferroni-corrected within env;
-$^{*}{:}p{<}0.05$, $^{**}{:}p{<}0.01$, $^{***}{:}p{<}0.001$).
-Methodology, per-method CIs, and raw returns: \cref{app:perenv,app:significance}.
-ENA scale: \cref{fig:headline}.}
+training steps ($100$ seeds for control, $50$ for CheetahRun). All
+cells are raw IQM in the task's native units; SAC (no expert) is
+the anchor row. Significance markers on each non-SAC row are
+two-sided Mann-Whitney $U$ tests of \emph{that method vs.\ SAC} on
+the per-seed final-window scalars, Holm-Bonferroni-corrected
+within env over the family of five expert-using methods
+($^{*}{:}p_{\mathrm{corr}}{<}0.05$,
+$^{**}{:}p_{\mathrm{corr}}{<}0.01$,
+$^{***}{:}p_{\mathrm{corr}}{<}0.001$).
+Methodology, per-method CIs, and ENA-normalized companion:
+\cref{app:perenv,app:significance,fig:headline}.}
 \label{tab:main_perenv}
 \end{table}
 
@@ -534,16 +569,14 @@ ENA scale: \cref{fig:headline}.}
 \centering
 \includegraphics[width=\linewidth]{figs/per_env_headline.pdf}
 \caption{Per-env asymptotic Expert-Normalized Advantage at
-$1\mathrm{M}$ training steps. ENA $= (J - J_{\mathrm{exp}})/(J_{\mathrm{ref}}
-- J_{\mathrm{exp}})$ with sign convention $\mathrm{ENA}\!=\!0$ at the
-expert and $\mathrm{ENA}\!=\!1$ at the per-task physical ceiling
-(\cref{eq:nbias}). For each (env, method), the tick is the per-method
-IQM and the rectangle is its $95\%$ stratified bootstrap CI; per-seed
-scalars (small dots) are trailing $200\mathrm{k}$-step mean returns.
-The Plane3DCircle panel is windowed: SAC and Residual SAC fall
-outside and appear as labelled arrows (full-axis version in
-\cref{fig:headline_uncensored}). Same data as \cref{tab:main_perenv},
-normalized.}
+$1\mathrm{M}$ steps. ENA $= (J - J_{\mathrm{exp}})/(J_{\mathrm{ref}}
+- J_{\mathrm{exp}})$, $0$ at the expert, $1$ at the per-task ceiling
+(\cref{eq:nbias}). Tick: per-method IQM; rectangle: $95\%$
+stratified bootstrap CI over trailing-$200\mathrm{k}$-step per-seed
+returns. The Plane3DCircle panel auto-zooms to the cluster of
+high-performers; SAC and Residual fall outside and appear as
+labelled arrows (full-axis version: \cref{fig:headline_uncensored}).
+Same data as \cref{tab:main_perenv}, normalized.}
 \label{fig:headline}
 \end{figure}
 
@@ -552,7 +585,7 @@ normalized.}
 
 We sweep three perturbation types (intensities per type and method
 in \cref{fig:degradation_body}): training-time \emph{expert
-mistuning} (log-scale perturbation of the controller's calibrated
+undertuning} (log-scale perturbation of the controller's calibrated
 parameters), deployment-time \emph{expert action bias} (per-seed
 constant offset on the expert's executed action), and deployment-time
 \emph{observation noise} (per-step Gaussian noise on the agent's
@@ -562,7 +595,7 @@ percent change is \cref{fig:degradation_appendix}.
 Reading \cref{fig:degradation_body}: on Plane3DCircle, Residual SAC
 is the only method that retains positive return under deployment-time
 perturbations despite the lowest clean ceiling, an
-asymptote-vs-robustness tradeoff invisible to the mistuning sweep
+asymptote-vs-robustness tradeoff invisible to the undertuning sweep
 alone.
 
 \begin{figure}[h]
@@ -571,7 +604,7 @@ alone.
   \includegraphics[width=0.92\linewidth]{figs/degradation_v2_bars_by_method_grid.pdf}}{}
 \caption{Per-environment perturbation sweep ($4\!\times\!3$ grid):
 rows are environments, columns are perturbation types
-(training-time \emph{expert mistuning}; deployment-time
+(training-time \emph{expert undertuning}; deployment-time
 \emph{expert action bias} and \emph{observation noise}). Each panel
 groups the five expert-using methods plus no-expert SAC; for every
 method, bars left-to-right are clean (darkest) and increasing $\sigma$.
@@ -585,13 +618,19 @@ companion in \cref{fig:degradation_appendix_raw}.}
 \subsection{EDGE Design Choices}
 \label{sec:design-ablation}
 
-Per-axis ablation on Plane3DCircle ($300\mathrm{k}$ steps, $50$ seeds)
-shows both quality-aware modifications are individually load-bearing:
-removing the softmax gate or the expert-state augmentation each
-costs $\sim$$70\%$ of EDGE's return; an additional LCB-gated TD
-bootstrap is approximately neutral. Full table, per-variant axis
-map, and the gating-form $\times$ pessimism $2\!\times\!2$ status:
-\cref{app:ablation}.
+We ablate $13$ EDGE variants per env on Plane3DCircle, CheetahRun,
+and FourTank ($50$ seeds, $300\mathrm{k}$ steps; the shorter
+horizon keeps all $39$ cells in budget. Full table and per-variant
+axis map in \cref{app:ablation}). Both quality-aware modifications
+are individually load-bearing on the discriminating env: removing
+the softmax gate or the expert-state augmentation each costs
+$\sim$$70\%$ of EDGE's return on Plane3DCircle, and an additional
+LCB-gated TD bootstrap is approximately neutral. On CheetahRun and
+FourTank the variant spread is small (every variant within seed
+noise of EDGE except the two sanity-check breakers,
+\texttt{random\_expert} and \texttt{store\_policy\_action}),
+consistent with both tasks' small between-method spread on the
+main results.
 
 % ============================================================
 \section{Discussion}
@@ -603,359 +642,186 @@ map, and the gating-form $\times$ pessimism $2\!\times\!2$ status:
 
 The benchmark exposes three mechanism-specific failure modes of
 expert-guided RL, each tied to a structural property of the expert
-or the integration mechanism. We identify each mode post-hoc from
-the cells it binds on, then state the mechanism, the empirical
-signature, and the task-structural condition under which the same
-failure should be expected to bind on held-out tasks; held-out
-validation is deferred to the next revision.
+or the integration mechanism. F2 (residual saturation) is a
+documented failure mode of additive-correction methods on weak
+experts, consistent with prior reports; we keep it in the taxonomy
+because the decision rule needs all three labels, but the novelty
+here is in F1 and F3, both
+of which are surfaced only by the harmonized comparison (F1: IBRL
+$<$ no-expert SAC on a near-ceiling-expert task) and the degradation
+sweep (F3: training-time-handoff collapse under expert undertuning) and
+have not, to our knowledge, been previously named or directionally
+tested. We identify each mode post-hoc from the regimes it binds on,
+then state the mechanism, the empirical signature, and the
+task-structural condition under which the same failure should be
+expected to bind on held-out tasks.
 
 \paragraph{F1: Critic blind spot (argmax-gating methods).}
-IBRL's argmax plus expert-action TD bootstrap
-(\cref{tab:baselines}) writes expert transitions whenever the expert
-wins in $Q$, so the critic receives no Bellman target at the policy
-action $\pi_\theta(s)$ on the expert-dominant set
-$\mathcal{M}_t$, while the SAC actor optimizes against
-$Q_\phi(s,\pi_\theta(s))$ on exactly that set. On near-ceiling
-experts $\mathcal{M}_t$ is persistent and IBRL falls \emph{below}
-pure SAC: directional permutation test on FourTank confirms the sign
-($p{=}0.031$, full stats in \cref{app:directional_tests}).
-\emph{Anchor:} FourTank ($98\%$ of best RL); the predicted
-held-out-task condition is an expert within $\sim$$10\%$ of best RL.
-Concurrent DRLR \citep{shen2026drlr} flags a distinct IBRL issue
-(OOD-action critic miscalibration); F1 is upstream of it and concerns
-the absence of \emph{any} fresh policy-action Bellman target on
-$\mathcal{M}_t$.
+IBRL combines argmax action selection with an expert-action TD
+bootstrap (\cref{tab:baselines}). On the states where the expert
+beats the policy in $Q$, both ingredients pull the critic toward
+the expert action, so the critic never gets fresh on-policy
+Bellman targets at the policy action even though the SAC actor
+optimizes against it. On near-ceiling experts these states are
+persistent, and IBRL falls \emph{below} no-expert SAC. The effect
+is real but small. We confirm the predicted sign with a one-sided
+permutation test on FourTank ($p{=}0.031$,
+\cref{tab:main_perenv,app:directional_tests}); we run it as a single
+directional test
+keyed on the F1 prediction, not as part of the per-env
+Mann-Whitney battery in \cref{tab:main_perenv}, where the
+multiple-comparison correction would absorb it. The
+\texttt{argmax\_lcb} ablation on FourTank keeps the argmax gate
+but drops both the IBRL bootstrap and the min-$Q$ scoring: it
+lands between IBRL and SAC, with the bootstrap accounting for
+most of the F1 gap and the argmax gate accounting for the rest.
+\emph{Anchor and replication.} F1 binds on FourTank
+($q^{\mathrm{exp}}\!=\!98\%$ of no-expert SAC return). We also
+ran the same one-sided test on GlassFurnace
+($q^{\mathrm{exp}}\!=\!80\%$) where IBRL is numerically
+\emph{above} no-expert SAC ($\Delta\!=\!+7.9$ IQM, $p{=}0.995$):
+F1 does not bind there. Holding $q^{\mathrm{exp}}$ as our
+predictor, the F1 binding regime is therefore tighter than
+``near-ceiling'' in the loose sense; we narrow the held-out
+condition to $q^{\mathrm{exp}}\!\gtrsim\!90\%$.
 
 \paragraph{F2: Residual saturation (additive-correction methods).}
-Residual SAC executes $a = \mathrm{clip}(a^e + a_{\mathrm{res}}, -1, 1)$
-with $a_{\mathrm{res}} \in [-1,1]$; the bounded correction cuts both
-ways. On weak experts the required correction exceeds the bound and
-Residual saturates below other methods regardless of training budget:
-clean gap to per-env best inversely tracks expert quality
-($0\%$ on FourTank/$98\%$, $9\%$ on CheetahRun/$36\%$,
-$64\%$ on Plane3DCircle/$50\%$ of best RL), confirmed by a directional
-permutation test on Plane3DCircle ($p{<}10^{-4}$, full stats in
-\cref{app:directional_tests}). On near-ceiling experts the
-same bound flips to an advantage: $a_{\mathrm{res}}\!\to\!0$ and
-Residual inherits the expert's return at the first evaluation step
-($10\mathrm{k}$ on FourTank, $86$/$100$ seeds for $J\!\geq\!240$),
-while every other method needs $700\mathrm{k}{+}$ steps to match.
-\emph{Anchors:} Plane3DCircle for the saturation half, FourTank for
-the free-expert-parity half; F2 is a tradeoff, not a unilateral
-failure mode.
+Residual SAC adds a bounded correction to the expert action and
+clips back into the action box. The bound cuts both ways. On weak
+experts the correction needed to escape the expert's structural
+errors exceeds the bound, and Residual gets capped well below the
+other methods regardless of training budget; on Plane3DCircle, the
+gap to JSRL-tt, IBRL, and EDGE is each significant at
+$p{<}10^{-4}$ (\cref{app:directional_tests}). On near-ceiling
+experts the same bound flips into an advantage: the correction
+collapses toward zero, Residual essentially inherits the expert
+from step zero, and the other methods need hundreds of thousands
+of steps to catch up. \emph{Anchors:} Plane3DCircle for the
+saturation half, FourTank for the free-expert-parity half. F2 is a
+tradeoff, not a unilateral failure mode.
 
 \paragraph{F3: Warm-start buffer poisoning (training-time handoff).}
-JSRL-training-time runs the expert for the first
-$\rho_{\mathrm{warm}} T$ steps; the warm-start buffer reflects the
-training-time expert and after handoff the policy trains on this
-poisoned buffer with no ongoing expert to anchor it. JSRL-tt has the
-strongest clean asymptote in the suite but under expert mistuning
-($\sigma{=}0.5$) loses $79\%$ on CheetahRun ($774\!\to\!161$) and
-reverses sign on Plane3DCircle ($+9488\!\to\!-8276$). Directional
-confirmation is observational (the v1 mistuning pipeline pre-dates
-per-seed logging): on Plane3DCircle $\sigma{=}0.5$, JSRL-tt's
-fractional drop is $187\%$ (sign reversal); the next-largest drop
-among the four other methods is IBRL's $39\%$ (still positive). The
-ratio $\sim$$4.8\times$ singles JSRL-tt out as the uniquely fragile
-method. \emph{Anchors:} CheetahRun and Plane3DCircle under mistuning;
-the predicted held-out-task condition is any deployment with a noisy,
-mistuned, or drifting training-time expert.
-
-F1 and F3 require the harmonized comparison and the degradation
-sweep, respectively, to surface; standard clean-expert evaluation
-sees only F2. On FourTank and GlassFurnace no query-time-expert
-method clears the expert at $1\mathrm{M}$ steps (the PIDs sit near
-their analytic ceiling): the contribution from these tasks is
-\emph{negative}, delineating where the entire family does not yet
-help.
+JSRL-training-time first runs the expert for a fixed warm-start
+fraction of training, then hands off to the policy. The buffer
+collected during warm-start reflects whichever expert was used at
+training time, and the policy then has to learn from this buffer
+with no further expert input. JSRL-tt has the strongest clean
+asymptote in the suite but its return collapses under expert
+undertuning. We confirm the predicted direction with a one-sided
+permutation test on Plane3DCircle at $\sigma{=}0.5$: JSRL-tt's
+per-seed final-window IQM is $-6{,}590$ against EDGE's $-4{,}745$
+($\Delta\!=\!-1{,}845$, $p{<}10^{-4}$,
+\cref{tab:directional_tests}). On CheetahRun JSRL-tt also loses
+most of its clean score under the same perturbation, while no
+other expert-using method shows a comparable drop.
+\emph{Anchors:} CheetahRun and Plane3DCircle under undertuning; we
+predict the same binding on any deployment with a noisy,
+undertuned, or drifting training-time expert.
 
 \subsection{Decision Rule: Which Method to Deploy When}
 \label{sec:when-to-use}
 
-The failure modes convert into a decision rule
-(\cref{tab:decision_rule}) keyed on three pre-training observables:
-expert quality $q \equiv J_{\mathrm{exp}}/J_{\mathrm{best\text{-}RL}}$
-(estimated by a short SAC pilot run or by analogy with similar
-published tasks), task termination, and expected perturbation type.
-The rule is fitted to the cells we have, with each branch anchored
-by one or two empirical points; held-out validation
-(Plane3DFigureEight, BarkourJoystick) is deferred.
+The failure modes convert into a deployment-scenario decision rule
+(\cref{tab:decision_rule}) keyed on three observables: expert
+quality $q^{\mathrm{exp}} \equiv J_{\mathrm{exp}}/J_{\mathrm{RL}}$
+(reported as a percentage in the table), task termination, and
+expected perturbation type. The denominator is the practitioner's
+main calibration cost: a $\sim$$10\%$ pilot SAC run, a published
+return on a structurally similar task, or, absent either, the
+conservative branch ($q^{\mathrm{exp}}$ unknown $\to$ treat as
+low). $J_{\mathrm{RL}}$ here is the no-expert-SAC asymptote, not
+ENA's $J_{\mathrm{ref}}$ physical ceiling: on FourTank
+$q^{\mathrm{exp}}\!=\!98\%$ even though the expert hits only
+$\sim$$49\%$ of $J_{\mathrm{ref}}$. ``RL-near-ceiling'' throughout
+refers to the $J_{\mathrm{RL}}$ scale.
 
 \begin{table}[h]
 \centering
 \footnotesize
-\renewcommand{\arraystretch}{1.25}
-\begin{tabularx}{\textwidth}{@{}>{\raggedright\arraybackslash}p{0.27\textwidth} >{\raggedright\arraybackslash}p{0.18\textwidth} >{\raggedright\arraybackslash}p{0.17\textwidth} X@{}}
+\renewcommand{\arraystretch}{1.15}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llccccccl@{}}
 \toprule
-\textbf{Pre-training condition} & \textbf{Binding failure} & \textbf{Recommended} & \textbf{Empirical anchor} \\
+\textbf{Scenario} & \textbf{Failure}
+& \textbf{IBRL} & \textbf{JSRL-c} & \textbf{JSRL-tt}
+& \textbf{Residual} & \textbf{EDGE} & \textbf{Anchor evidence} \\
 \midrule
-$q\!\gtrsim\!0.9$, non-terminating, clean deploy & F1 (IBRL blind spot) & Residual SAC & FourTank: IBRL $<$ SAC ($p\!=\!0.031$); Residual $J\!\geq\!240$ at $10\mathrm{k}$ steps \\
-$q\!\lesssim\!0.6$, non-terminating, clean deploy & F2 (residual saturation) & IBRL / JSRL-curriculum & CheetahRun: Residual $-9\%$ \\
-Terminating, clean deploy & F1 + F2 & JSRL-curriculum / EDGE & Plane3DCircle clean: Residual $-64\%$ \\
+$q^{\mathrm{exp}}\!\gtrsim\!90\%$, non-term., clean   & F1     & $\times$ &          &          & $\checkmark$ &              & FT: IBRL$<$SAC ($p{=}0.031$) \\
+$q^{\mathrm{exp}}\!\lesssim\!60\%$, non-term., clean  & F2     & $\checkmark$ & $\checkmark$ &      & $\times$    &              & CR: Residual $-9\%$ \\
+Terminating, clean                          & F1+F2  &          & $\checkmark$ &      & $\times$    & $\checkmark$ & P3DC: Residual capped at $-64\%$ \\
 \midrule
-Mistuning of training-time expert & F3 (warm-start poisoning) & JSRL-curriculum / EDGE & Plane3DCircle, $\sigma\!=\!0.5$: JSRL-tt $-8276$ vs EDGE $+6569$ \\
-Deployment-time noise (action bias, obs noise) & asymptote-vs-robustness tradeoff & Residual SAC & Plane3DCircle action-bias $\sigma\!=\!0.25$: Residual $+3084$ vs others $\leq\!-4492$ \\
+Undertuned training-time expert             & F3     &          & $\checkmark$ & $\times$ &          & $\checkmark$ & P3DC $\sigma{=}0.5$ undertune \\
+Deployment action / obs noise               & ---    &          &          &          & $\checkmark$ &              & P3DC action-bias $\sigma{=}0.25$ \\
 \bottomrule
-\end{tabularx}
-\caption{Decision rule, keyed on three pre-training observables
-(expert quality $q$, task termination, expected perturbation type).
-The two perturbation rows split by perturbation type: training-time
-mistuning binds F3 and favors curriculum or state-conditional gating
-(JSRL-curriculum or EDGE), while deployment-time action/observation
-noise exposes an asymptote-vs-robustness tradeoff in which Residual
-SAC's bounded correction is the only method that retains positive
-return on the terminating Plane3DCircle anchor. When both
-perturbation types are expected jointly, no single method dominates
-on the cells we have; the practitioner picks the more-likely
-perturbation row.}
+\end{tabular}
+\caption{Decision rule. \emph{Clean} = no expert undertuning and no
+deployment-time noise; \emph{terminating} = episodes can end early
+on failure (e.g.\ the aircraft crashing on Plane3DCircle).
+$\checkmark$ recommends, $\times$ flags a known failure on the
+anchor evidence, blank is unconstrained.}
 \label{tab:decision_rule}
 \end{table}
+
+The two perturbation rows split cleanly: training-time undertuning
+favors methods that keep falling back to the expert at every state
+(JSRL-curriculum, EDGE); deployment-time noise favors Residual's
+bounded correction. When both perturbations are expected together,
+no method dominates on the regimes we have.
 
 \subsection{Limitations}
 \label{sec:limitations}
 
 \paragraph{Scope.}
-Four tasks (compute-bound; held-out validation on Plane3DFigureEight
-and BarkourJoystick deferred). EDGE requires a queryable expert at
+Four tasks (compute-bound). EDGE requires a queryable expert at
 every state (fixed-dataset demos out of scope), dense rewards, and an
-ensemble critic with non-degenerate disagreement. All methods get $30$
-Optuna trials per task; EDGE's $14$-dim search space is therefore
-under-sampled relative to the $10$--$11$-dim baselines, biasing
-\emph{against} our method. Full scope, compute, and HPO discussion in
+ensemble critic with non-degenerate disagreement. All methods get $30$ Optuna trials per task. EDGE has $14$ search
+dimensions vs $10$--$11$ for baselines, so the per-dimension trial
+budget is coarser for EDGE. This biases the comparison
+\emph{against} our method: EDGE's reported numbers are a lower bound
+on what budget-matched search would yield, not an artifact of an
+inflated trial budget. Full scope, compute, and HPO discussion in
 \cref{app:limitations_extra}.
 
-\paragraph{Broader impacts.}
-Positive: the failure-mode taxonomy and decision rule reduce
-per-method tuning effort for practitioners deploying RL on top of
-existing controllers, and the F3 finding flags a deployment-time
-risk easy to miss without harmonized evaluation. Negative: methods
-that beat tuned PIDs can be deployed without proper safety
-verification, especially under F3. No high-misuse-risk asset is
-released.
+\paragraph{When the expert is enough.}
+On FourTank ($q^{\mathrm{exp}}\!=\!98\%$) and GlassFurnace
+($80\%$) no expert-using RL method clears the expert at
+$1\mathrm{M}$ steps; we cannot rule out that a longer horizon
+($5{-}10\mathrm{M}$) would let the within-noise lag pull ahead.
+Within our budget the honest call is to deploy the expert
+directly. Closing the remaining gap to the physical ceiling on an
+already-strong expert is left to future work.
 
 % ============================================================
 \section{Conclusion}
 \label{sec:conclusion}
 % ============================================================
 
-A common-protocol comparison of query-time-expert RL methods yields
-four answers to the questions opening \cref{sec:experiments}.
-\textbf{Q1:} no single method dominates. \textbf{Q2:} F1/F2/F3 bind
-on the predicted task-structure cells (IBRL $<$ SAC on FourTank,
-Residual saturates on Plane3DCircle, JSRL-tt collapses under expert
-mistuning). \textbf{Q3:} clean rankings reverse under perturbation;
-JSRL-tt is asymptote-strongest but most fragile, EDGE ties
-JSRL-curriculum for smallest worst-case gap. \textbf{Q4:} both EDGE
-modifications are individually load-bearing (\cref{app:ablation}).
-
-The answers convert into a decision rule (\cref{sec:when-to-use})
-keyed on three pre-training observables. EDGE is a design-axis probe,
-not a SOTA claim: its value is to show that gating form and pessimism
-are individually exploitable.
-
-\paragraph{Future work.}
-Held-out validation on Plane3DFigureEight and BarkourJoystick; literal
-pessimistic Thompson sampling \citep{russo2014ts}; RLPD-style hybrid
-online-plus-offline replay.
+In this work we ran a harmonized head-to-head comparison of
+query-time-expert RL methods on a shared SAC backbone, common HPO,
+and a four-task benchmark, with a degradation sweep covering
+expert undertuning and deployment-time perturbations.
+No single method dominates: each wins on one task-structure
+regime and fails predictably elsewhere. F1/F2/F3
+bind where the taxonomy predicts (IBRL $<$ SAC on FourTank,
+Residual saturates on Plane3DCircle, JSRL-tt collapses under
+expert undertuning), and clean rankings reverse under perturbation.
+The benchmark, taxonomy, and decision rule
+(\cref{sec:when-to-use}) are the primary contribution; EDGE is
+offered as evidence that gate form and scoring rule are
+individually exploitable design axes, not as a SOTA claim. Several extensions remain natural follow-ups: a hybrid that mixes
+RLPD-style offline-plus-online replay with our online-mixing
+gate, a stretch from deterministic continuous-control experts to
+stochastic and discrete-action ones, and an evaluation of the same
+gate-and-scoring decomposition layered on off-policy backbones
+other than SAC.
 
 
 
 
 % ============================================================
 \bibliographystyle{plainnat}
-\begin{thebibliography}{99}
+\bibliography{refs}
 
-\bibitem[Akiba et al.(2019)]{akiba2019optuna}
-T.~Akiba, S.~Sano, T.~Yanase, T.~Ohta, and M.~Koyama.
-\newblock Optuna: A next-generation hyperparameter optimization framework.
-\newblock In \emph{KDD}, 2019.
-\newblock URL \url{https://doi.org/10.1145/3292500.3330701}.
-
-\bibitem[Bloor et al.(2024)]{bloor2024pcgym}
-M.~Bloor, J.~Torraca, I.~O. Sandoval, A.~Ahmed, M.~White, M.~Mercang\"{o}z,
-C.~Tsay, E.~A. del~R{\'i}o-Chanona, and M.~Mowbray.
-\newblock PC-Gym: Benchmark environments for process control problems.
-\newblock \emph{arXiv:2410.22093}, 2024.
-\newblock URL \url{https://arxiv.org/abs/2410.22093}.
-
-\bibitem[Agarwal et al.(2021)]{agarwal2021rliable}
-R.~Agarwal, M.~Schwarzer, P.~S. Castro, A.~C. Courville, and M.~G. Bellemare.
-\newblock Deep reinforcement learning at the edge of the statistical precipice.
-\newblock In \emph{NeurIPS}, 2021.
-\newblock URL \url{https://proceedings.neurips.cc/paper/2021/hash/f514cec81cb148559cf475e7426eed5e-Abstract.html}.
-
-\bibitem[Fu et al.(2020)]{fu2020d4rl}
-J.~Fu, A.~Kumar, O.~Nachum, G.~Tucker, and S.~Levine.
-\newblock D4RL: Datasets for deep data-driven reinforcement learning.
-\newblock \emph{arXiv:2004.07219}, 2020.
-\newblock URL \url{https://arxiv.org/abs/2004.07219}.
-
-\bibitem[Mandlekar et al.(2021)]{mandlekar2021robomimic}
-A.~Mandlekar, D.~Xu, J.~Wong, S.~Nasiriany, C.~Wang, R.~Kulkarni,
-L.~Fei-Fei, S.~Savarese, Y.~Zhu, and R.~Mart\'in-Mart\'in.
-\newblock What matters in learning from offline human demonstrations for robot manipulation.
-\newblock In \emph{CoRL}, 2021.
-\newblock URL \url{https://proceedings.mlr.press/v164/mandlekar22a.html}.
-
-\bibitem[Ball et al.(2023)]{ball2023rlpd}
-P.~Ball, L.~Smith, I.~Kostrikov, and S.~Levine.
-\newblock Efficient online reinforcement learning with offline data.
-\newblock In \emph{ICML}, 2023.
-\newblock URL \url{https://proceedings.mlr.press/v202/ball23a.html}.
-
-\bibitem[Haarnoja et al.(2018)]{haarnoja2018sac}
-T.~Haarnoja, A.~Zhou, P.~Abbeel, and S.~Levine.
-\newblock Soft actor-critic: Off-policy maximum entropy deep reinforcement
-    learning with a stochastic actor.
-\newblock In \emph{ICML}, 2018.
-\newblock URL \url{https://proceedings.mlr.press/v80/haarnoja18b.html}.
-
-\bibitem[Hu et al.(2024)]{hu2023ibrl}
-H.~Hu, S.~Mirchandani, and D.~Sadigh.
-\newblock Imitation bootstrapped reinforcement learning.
-\newblock In \emph{RSS}, 2024.
-\newblock URL \url{https://www.roboticsproceedings.org/rss20/p056.pdf}.
-
-\bibitem[Shen and Sloth(2026)]{shen2026drlr}
-C.~Shen and C.~Sloth.
-\newblock Solving robotics tasks with prior demonstration via exploration-efficient deep reinforcement learning.
-\newblock \emph{Frontiers in Robotics and AI}, 12, 2026.
-\newblock Preprint: \emph{arXiv:2509.04069}, 2025.
-\newblock URL \url{https://www.frontiersin.org/journals/robotics-and-ai/articles/10.3389/frobt.2025.1682200/full}.
-
-\bibitem[Johannink et al.(2019)]{johannink2019residual}
-T.~Johannink, S.~Bahl, A.~Nair, J.~Luo, A.~Kumar, M.~Loskyll,
-    J.~A. Ojea, E.~Solowjow, and S.~Levine.
-\newblock Residual reinforcement learning for robot control.
-\newblock In \emph{ICRA}, 2019.
-\newblock URL \url{https://ieeexplore.ieee.org/document/8794127}.
-
-\bibitem[Lee et al.(2021)]{lee2021sunrise}
-K.~Lee, M.~Laskin, A.~Srinivas, and P.~Abbeel.
-\newblock {SUNRISE}: A simple unified framework for ensemble learning in deep RL.
-\newblock In \emph{ICML}, 2021.
-\newblock URL \url{https://proceedings.mlr.press/v139/lee21g.html}.
-
-\bibitem[Nair et al.(2020)]{nair2020awac}
-A.~Nair, A.~Gupta, M.~Dalal, and S.~Levine.
-\newblock {AWAC}: Accelerating online reinforcement learning with offline datasets.
-\newblock \emph{arXiv:2006.09359}, 2020.
-\newblock URL \url{https://arxiv.org/abs/2006.09359}.
-
-\bibitem[Ross et al.(2011)]{ross2011dagger}
-S.~Ross, G.~Gordon, and D.~Bagnell.
-\newblock A reduction of imitation learning and structured prediction to
-    no-regret online learning.
-\newblock In \emph{AISTATS}, 2011.
-\newblock URL \url{https://proceedings.mlr.press/v15/ross11a.html}.
-
-\bibitem[\r{A}str\"{o}m and H\"{a}gglund(1984)]{astrom1984relay}
-K.~J. \r{A}str\"{o}m and T.~H\"{a}gglund.
-\newblock Automatic tuning of simple regulators with specifications on phase
-    and amplitude margins.
-\newblock \emph{Automatica}, 20(5):645--651, 1984.
-\newblock URL \url{https://doi.org/10.1016/0005-1098(84)90014-1}.
-
-\bibitem[\r{A}str\"{o}m and H\"{a}gglund(2005)]{astrom2005amigo}
-K.~J. \r{A}str\"{o}m and T.~H\"{a}gglund.
-\newblock \emph{Advanced PID Control}.
-\newblock ISA, 2005.
-\newblock URL \url{https://www.isa.org/products/advanced-pid-control}.
-
-\bibitem[Russo and Van Roy(2014)]{russo2014ts}
-D.~Russo and B.~Van~Roy.
-\newblock Learning to optimize via posterior sampling.
-\newblock \emph{Mathematics of Operations Research}, 39(4):1221--1243, 2014.
-\newblock URL \url{https://doi.org/10.1287/moor.2014.0650}.
-
-\bibitem[Russo et al.(2018)]{russo2018tutorial}
-D.~Russo, B.~Van~Roy, A.~Kazerouni, I.~Osband, and Z.~Wen.
-\newblock A tutorial on Thompson sampling.
-\newblock \emph{Foundations and Trends in Machine Learning}, 11(1):1--96, 2018.
-\newblock URL \url{https://doi.org/10.1561/2200000070}.
-
-\bibitem[Osband et al.(2016)]{osband2016bootstrappeddqn}
-I.~Osband, C.~Blundell, A.~Pritzel, and B.~Van~Roy.
-\newblock Deep exploration via bootstrapped DQN.
-\newblock In \emph{NeurIPS}, 2016.
-\newblock URL \url{https://proceedings.neurips.cc/paper/2016/hash/8d8818c8e140c64c743113f563cf750f-Abstract.html}.
-
-\bibitem[An et al.(2021)]{an2021edac}
-G.~An, S.~Moon, J.-H. Kim, and H.~O. Song.
-\newblock Uncertainty-based offline reinforcement learning with diversified
-    Q-ensemble.
-\newblock In \emph{NeurIPS}, 2021.
-\newblock URL \url{https://proceedings.neurips.cc/paper/2021/hash/3d3d286a8d153a4a58156d0e02d8570c-Abstract.html}.
-
-\bibitem[Ghasemipour et al.(2022)]{ghasemipour2022msg}
-S.~K.~S. Ghasemipour, S.~S. Gu, and O.~Nachum.
-\newblock Why so pessimistic? Estimating uncertainties for offline RL through
-    ensembles, and why their independence matters.
-\newblock In \emph{NeurIPS}, 2022.
-\newblock URL \url{https://proceedings.neurips.cc/paper_files/paper/2022/hash/7423902b5534e2b267438c85444a54b1-Abstract-Conference.html}.
-
-\bibitem[Wu et al.(2016)]{wu2016conservative}
-Y.~Wu, R.~Shariff, T.~Lattimore, and C.~Szepesv\'{a}ri.
-\newblock Conservative bandits.
-\newblock In \emph{ICML}, 2016.
-\newblock URL \url{https://proceedings.mlr.press/v48/wu16.html}.
-
-\bibitem[Kazerouni et al.(2017)]{kazerouni2017conservative}
-A.~Kazerouni, M.~Ghavamzadeh, Y.~Abbasi-Yadkori, and B.~Van~Roy.
-\newblock Conservative contextual linear bandits.
-\newblock In \emph{NeurIPS}, 2017.
-\newblock URL \url{https://proceedings.neurips.cc/paper/2017/hash/bdc4626aa1d1df8e14d80d345b2a442d-Abstract.html}.
-
-\bibitem[Johansson(2000)]{johansson2000quadruple}
-K.~H. Johansson.
-\newblock The quadruple-tank process: A multivariable laboratory process with
-    an adjustable zero.
-\newblock \emph{IEEE Transactions on Control Systems Technology}, 8(3):456--465,
-    2000.
-\newblock URL \url{https://doi.org/10.1109/87.845876}.
-
-\bibitem[Storn and Price(1997)]{storn1997de}
-R.~Storn and K.~Price.
-\newblock Differential evolution, a simple and efficient heuristic for global
-    optimization over continuous spaces.
-\newblock \emph{Journal of Global Optimization}, 11(4):341--359, 1997.
-\newblock URL \url{https://doi.org/10.1023/A:1008202821328}.
-
-\bibitem[Uchendu et al.(2023)]{uchendu2023jsrl}
-I.~Uchendu, T.~Xiao, Y.~Lu, B.~Zhu, M.~Yan, J.~Simon, M.~Bennice,
-    C.~Fu, C.~Ma, J.~Jiao, S.~Levine, and K.~Hausman.
-\newblock {JSRL}: Jump-start reinforcement learning.
-\newblock In \emph{ICML}, 2023.
-\newblock URL \url{https://proceedings.mlr.press/v202/uchendu23a.html}.
-
-\bibitem[Zhang et al.(2023)]{zhang2023pex}
-H.~Zhang, W.~Xu, and H.~Yu.
-\newblock Policy expansion for bridging offline-to-online reinforcement
-    learning.
-\newblock In \emph{ICLR}, 2023.
-\newblock URL \url{https://openreview.net/forum?id=-Y34L45JR6z}.
-
-\bibitem[Rengarajan et al.(2022)]{rengarajan2022logo}
-D.~Rengarajan, G.~Vaidya, A.~Sarvesh, D.~Kalathil, and S.~Shakkottai.
-\newblock Reinforcement learning with sparse rewards using guidance from
-    offline demonstration.
-\newblock In \emph{ICLR}, 2022.
-\newblock URL \url{https://openreview.net/forum?id=YJ1WzgMVsMt}.
-
-\bibitem[Kostrikov et al.(2022)]{kostrikov2022iql}
-I.~Kostrikov, A.~Nair, and S.~Levine.
-\newblock Offline reinforcement learning with implicit Q-learning.
-\newblock In \emph{ICLR}, 2022.
-\newblock URL \url{https://openreview.net/forum?id=68n2s9ZJWF8}.
-
-\bibitem[Zakka et al.(2025)]{mujocoplayground2024}
-K.~Zakka et al.
-\newblock {MuJoCo Playground}: An open-source framework for GPU-accelerated
-    robot learning and sim-to-real transfer.
-\newblock \emph{arXiv:2502.08844}, 2025.
-\newblock URL \url{https://arxiv.org/abs/2502.08844}.
-
-\end{thebibliography}
 
 % ============================================================
 \appendix
@@ -969,27 +835,32 @@ We state and prove the two formal results behind the informal
 
 \begin{remark}[Critic blind spot under argmax selection]
 \label{rem:blindspot}
-Let $\mathcal{M}_t = \{s : Q_\phi(s,\pi^e(s)) > \mathbb{E}_{a\sim
+Let $\mathcal{M}_t = \{s : Q_\phi(s,\pi^{\mathrm{exp}}(s)) > \mathbb{E}_{a\sim
 \pi_\theta(\cdot|s)} Q_\phi(s,a)\}$. Under IBRL-style argmax, no
 fresh transition $(s, a, \cdot, \cdot)$ with $s\in\mathcal{M}_t$ and
-$a\neq\pi^e(s)$ enters the buffer at step $t$. The Bellman regression
+$a\neq\pi^{\mathrm{exp}}(s)$ enters the buffer at step $t$. The Bellman regression
 is therefore insensitive to $Q_\phi(s, \pi_\theta(s))$ on
 $\mathcal{M}_t$ for as long as $\mathcal{M}_t$ persists.
 \end{remark}
 
-\begin{lemma}[Coverage under pessimism-gated mixing]
+\begin{lemma}[Uniform coverage under bounded gate gap]
 \label{lem:coverage}
-Under the gate \eqref{eq:behavior} with finite pessimism gap, every
-visited $s$ accumulates policy-action Bellman anchors at expected
-rate $(1 - p_t(s))\,\mu_t(s) > 0$, so no persistent analogue of
-$\mathcal{M}_t$ can form.
+Let $\Delta_t(s) := \check{Q}_t(s,\pi^{\mathrm{exp}}(s)) - \check{Q}_t(s,
+\pi_\theta(s))$ be the gate gap on visited states, and suppose
+$\sup_{s\in\mathrm{supp}(\mu_t)}\Delta_t(s) \le \Delta_{\max}$ at
+step $t$. Then the gate \eqref{eq:behavior} with fixed bandwidth
+$\tau$ satisfies the \emph{uniform} bound $p_t(s) \le p_{\max} :=
+\sigma(\Delta_{\max}/\tau) < 1$, and policy-arm Bellman anchors
+accumulate at rate at least $(1 - p_{\max})\mu_t(s)$ at every
+visited $s$. Consequently, no analogue of $\mathcal{M}_t$ persists
+on the visited support so long as the gap stays bounded.
 \end{lemma}
 
 \paragraph{Why the bias is mechanistic.} Whenever the expert wins at
-state $s$, IBRL-style argmax stores $(s, \pi^e(s), r, s')$ in the
+state $s$, IBRL-style argmax stores $(s, \pi^{\mathrm{exp}}(s), r, s')$ in the
 replay buffer, and the critic's Bellman regression target on that
-tuple anchors $Q_\phi(s, \pi^e(s))$, not $Q_\phi(s, a)$ for
-$a \neq \pi^e(s)$. The SAC actor update reads
+tuple anchors $Q_\phi(s, \pi^{\mathrm{exp}}(s))$, not $Q_\phi(s, a)$ for
+$a \neq \pi^{\mathrm{exp}}(s)$. The SAC actor update reads
 $\nabla_\theta \mathbb{E}_{s \sim \mathcal{B},\, a \sim \pi_\theta(\cdot
 | s)}[Q_\phi(s, a) - \alpha \log \pi_\theta(a|s)]$: the stored action
 does not enter the gradient directly, but the gradient's quality
@@ -1006,14 +877,27 @@ $Q_\phi$ at policy-proposed actions on $\mathcal{M}_t$.
 
 \begin{proof}[Proof of \cref{lem:coverage}]
 Conditional on the state, the gate is a Bernoulli draw with parameter
-$p_t(s) = \sigma\big((\check{Q}_t(s,\pi^e(s)) - \check{Q}_t(s,
-\pi_\theta(s)))/\tau\big)$. As the image of a finite real number
-under the logistic, $p_t(s) \in (0, 1)$. The policy arm therefore
-has positive mass at every visited $s$, and the per-step rate of
-policy-action Bellman anchors at $s$ is exactly
-$(1 - p_t(s))\,\mu_t(s)$ by the law of total probability over $\mu_t$.
+$p_t(s) = \sigma(\Delta_t(s)/\tau)$. The logistic $\sigma$ is monotone
+increasing, so the gap upper bound transports to
+$p_t(s) \le \sigma(\Delta_{\max}/\tau) =: p_{\max} < 1$ for every
+$s\in\mathrm{supp}(\mu_t)$. The per-step rate of policy-action
+Bellman anchors at $s$ is therefore at least $(1 - p_{\max})\mu_t(s)$
+by the law of total probability over $\mu_t$, uniformly in $s$.
 \qedhere
 \end{proof}
+
+\paragraph{Where the bound enters and where it can fail.} The
+hypothesis $\Delta_t(s) \le \Delta_{\max}$ is what converts pointwise
+positivity ($p_t(s) < 1$ by the logistic) into a uniform rate that
+rules out exponentially-vanishing policy-arm coverage. With unbounded
+rewards or critic outputs, $\Delta_t$ can grow without bound on a
+state where the expert wins by an arbitrary margin and $p_t(s)\to 1$
+becomes possible at any rate. In our benchmark $r$ is bounded and the
+critic ensemble is regularized, so the hypothesis holds with
+$\Delta_{\max}$ on the order of the per-task return scale; an
+empirical estimate of $p_{\max} = \max_{s\in\mathcal{B}}p_t(s)$ over
+recent buffer samples is the obvious diagnostic and is the quantity
+one would log to verify the lemma's hypothesis at training time.
 
 
 \section{Per-Environment Results}
@@ -1042,7 +926,7 @@ resolution on the comparison that matters for the F1/F2/F3 story.}
 \includegraphics[width=0.92\linewidth]{figs/aggregated_rliable.pdf}
 \caption{Cross-env aggregated rliable view: per-method IQM (tick)
 and stratified-bootstrap IQR (rectangle), aggregated across envs.
-Right panel: mean $\nbias$ over the mistuning $\sigma$ sweep.
+Right panel: mean $\nbias$ over the undertuning $\sigma$ sweep.
 Demoted from the body because the cross-env aggregate hides the
 F1/F2/F3 mechanism story visible in \cref{fig:headline}.}
 \label{fig:aggregated}
@@ -1114,13 +998,16 @@ from the \texttt{sac\_quality\_aware} HPO study and retrains at
 $300\mathrm{k}$ steps with $50$ seeds (a shorter horizon than the
 $1\mathrm{M}$-step main study, chosen to fit the per-variant compute
 budget; relative cost percentages are computed against an
-EDGE proxy at the same horizon). Variants run on Plane3DCircle and CheetahRun:
-Plane3DCircle has the largest between-method spread of any benchmark
-task and gives clean signal-to-noise for design-choice ablations;
-CheetahRun stresses the same knobs on a non-terminating task with a
-weak expert. FourTank is excluded as an ablation env because the
-per-seed standard deviation ($\sim 10$ on a $\sim 240$ scale) makes
-sub-method-swap effects borderline even with $50$ seeds.
+EDGE proxy at the same horizon). Variants run on Plane3DCircle,
+CheetahRun, and FourTank: Plane3DCircle has the largest
+between-method spread of any benchmark task and gives clean
+signal-to-noise for design-choice ablations; CheetahRun stresses
+the same knobs on a non-terminating task with a weak expert.
+FourTank's per-seed standard deviation ($\sim 10$ on a $\sim 240$
+scale) makes sub-method-swap effects borderline at $50$ seeds, but
+we run the same $13$ variants there too because FourTank is the
+F1-anchor task and reviewer-flagged: see the FT panel
+(\cref{fig:ablation_ft}) below.
 
 \paragraph{Variant $\to$ axis map.}
 \begin{center}
@@ -1129,7 +1016,7 @@ sub-method-swap effects borderline even with $50$ seeds.
 \toprule
 \textbf{Variant} & \textbf{Knob flipped} & \textbf{Axis tested} \\
 \midrule
-\texttt{gating\_argmax}        & softmax over LCB $\to$ argmax over mean-$Q$ & gating form $\times$ pessimism (joint) \\
+\texttt{gating\_argmax}        & softmax over LCB $\to$ argmax over mean-$Q$ & gate form and pessimism, jointly \\
 \texttt{bootstrap\_argmax}     & add IBRL-style $\max(Q_\pi, Q_*)$ TD target & critic-bootstrap composition with IBRL \\
 \texttt{bootstrap\_lcb\_gated} & apply LCB gate at the TD bootstrap too      & LCB consistency at value vs.\ action \\
 \texttt{no\_state\_aug}        & drop obs $\oplus$ expert-state augmentation & preprocessing (non-Markov fix) \\
@@ -1137,6 +1024,7 @@ sub-method-swap effects borderline even with $50$ seeds.
 \texttt{random\_expert}        & PID/CPG expert $\to$ stateful random policy & expert-signal sanity \\
 \texttt{store\_policy\_action} & buffer stores policy action, not executed   & off-policy correctness \\
 \texttt{expert\_prefill}       & $100\mathrm{k}$ expert prefill on top of EDGE & orthogonal additivity with the F3 fix \\
+\texttt{literal\_thompson}     & EDGE softmax-LCB $\to$ literal Gaussian Thompson sampling on $(\mu_e,\sigma_e),(\mu_p,\sigma_p)$ & gate parameterization (TS vs softmax) \\
 \bottomrule
 \end{tabular}
 \end{center}
@@ -1169,35 +1057,96 @@ FourTank         & 0.12 (lower bound) & 1.64 & no & near-ceiling (98\% of best R
 \label{tab:beta_per_task}
 \end{table}
 
-\paragraph{Gating-form vs.\ pessimism: 2$\times$2 status.}
-A clean decomposition of the abstract's two-axis claim (gating form,
-pessimism) requires four corners of a $2\times 2$:
+\paragraph{Gate form versus scoring rule: four-corner status.}
+The abstract's two-axis claim (gate form and scoring rule) expands
+into four corners. The variant names below label each corner by
+what the implementation actually computes (argmax/softmax over
+min-of-ensemble $Q$ vs.\ LCB score $\check Q = \mu - \kappa\sigma$);
+the populated four-corner IQM table is reported alongside the
+literal-Thompson discussion below.
 \begin{center}
 \small
 \begin{tabular}{lll}
 \toprule
 & \textbf{argmax gate} & \textbf{softmax gate} \\
 \midrule
-\textbf{mean-$Q$ scoring}  & \texttt{gating\_argmax} (run) & not yet run                  \\
-\textbf{LCB scoring}       & not yet run                   & EDGE default (run, all envs) \\
+\textbf{min-$Q$ scoring}   & \texttt{gating\_argmax}        & \texttt{no\_pessimism} ($\kappa{=}0$) \\
+\textbf{LCB scoring}       & \texttt{argmax\_lcb}           & EDGE default (all envs)               \\
 \bottomrule
 \end{tabular}
 \end{center}
-Two corners are populated; the off-diagonal pair (softmax over
-mean-$Q$, argmax over LCB) is reserved for the next iteration so
-gating form and pessimism can each be isolated against the other
-held fixed. Until then the abstract's "gating form and pessimism
-ablated separately" should be read as: gating form is ablated
-directly via \texttt{gating\_argmax} (jointly with pessimism), and
-pessimism is swept continuously via $\kappa$ in HPO; clean
-single-axis isolation is pending.
+All four corners are populated by ablations on Plane3DCircle.
 
-\paragraph{Status.} As of this draft, four variants
-(\texttt{bootstrap\_lcb\_gated}, \texttt{gating\_argmax},
-\texttt{no\_obs\_norm}, \texttt{no\_state\_aug}) have completed on
-Plane3DCircle; the remaining variants are mid-queue (per-cell
-results in \texttt{ablation\_results/<env>\_\_<variant>.json} on
-release).
+\paragraph{Literal Thompson sampling vs softmax-LCB gate.}
+The \texttt{literal\_thompson} variant replaces EDGE's
+fixed-bandwidth softmax over LCB scores with literal Gaussian-
+parametric Thompson sampling on the same critic ensemble: at each
+state the gate draws $\tilde q_e \sim \mathcal{N}(\mu_e, \sigma_e^2)$
+and $\tilde q_p \sim \mathcal{N}(\mu_p, \sigma_p^2)$ from the empirical
+ensemble mean/std and selects the larger draw. On Plane3DCircle this
+underperforms EDGE by $\approx 1{,}965$ IQM ($4{,}265$ vs $6{,}230$);
+on CheetahRun it ties EDGE within seed noise ($578$ vs $\approx 590$,
+on a task whose ablation spread is small).
+
+A natural reading of this gap is the under-dispersion of small
+critic ensembles
+\citep{osband2016bootstrappeddqn,an2021edac,ghasemipour2022msg}: with
+$N\!\in\!\{2,4\}$, the empirical ensemble std is a biased low
+estimator of the posterior std, so the Thompson draws collapse
+toward $\mathrm{argmax}_a \mu_a$ and the policy arm gets starved.
+The \texttt{literal\_thompson\_k10} variant directly tests this by
+re-running literal Thompson sampling with a $N{=}10$ ensemble
+(roughly $2.5\times$ the per-step critic cost of $N{=}4$). On
+Plane3DCircle the gap to EDGE is essentially unchanged: $4{,}190$ at
+$N{=}10$ vs $4{,}265$ at $N{\in}\{2,4\}$, both well below EDGE's
+$6{,}230$. We therefore reject under-dispersion as the operative
+mechanism for the EDGE-vs-literal-TS gap.
+
+The cleaner reading, consistent with the four-corner table below,
+is that the load-bearing piece is the \emph{pessimism shift}
+that LCB scoring applies to both arms ($\check Q = \mu - \kappa
+\sigma$, with $\kappa$ tuned by HPO), not the gate parameterization.
+Literal Thompson sampling is symmetric noise around $\mu$ on each
+arm; swapping it for the LCB shift biases the gate against
+high-uncertainty actions on both arms, which is what removes the F1
+critic-blind-spot pathology.
+
+\paragraph{Gate form and scoring rule, four corners populated.}
+With \texttt{argmax\_lcb} closed, all four corners are populated on
+Plane3DCircle ($300\mathrm{k}$ steps, $50$ seeds):
+\begin{center}
+\small
+\begin{tabular}{lcc}
+\toprule
+& \textbf{argmax gate} & \textbf{softmax gate} \\
+\midrule
+\textbf{min-$Q$ scoring}   & $2{,}293$ & $6{,}109$ \\
+\textbf{LCB scoring}       & $5{,}468$ & $\mathbf{6{,}230}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Reading column-wise (gate-form effect at fixed scoring): softmax
+beats argmax by $+3{,}816$ at min-$Q$ and only $+762$ at LCB.
+Reading row-wise (scoring effect at fixed gate-form): LCB beats
+min-$Q$ by $+3{,}175$ at argmax and $+121$ at softmax. The
+$\{+121, +762\}$ off-diagonal increments are within plausible seed
+noise at $50$ seeds, so the data more cleanly support \emph{either
+lever alone (softmax with min-$Q$, or argmax with LCB) recovers
+nearly all of EDGE's score} than a strong "they are not redundant"
+claim; EDGE is nominally best at $6{,}230$ but the LCB-vs-min-$Q$
+gap at the softmax corner is too small to read as a real
+incremental contribution from softmax on top of LCB. The
+load-bearing finding is the diagonal: the $(argmax, min-Q)$ corner
+that IBRL occupies ($2{,}293$) is by far the worst, and either of
+EDGE's two design choices alone is sufficient to escape it. The
+literal-TS head-to-head above further isolates LCB's
+pessimism-shift as the bigger of the two levers.
+
+\paragraph{Reproducibility.} Per-variant per-env results are
+released as
+\texttt{ablation\_results/<env>\_\_<variant>.json} in the harness
+mirror; the figure and the four-corner table above are regenerated
+from those JSONs by \texttt{plot\_sweep.py --paper}.
 
 \begin{figure}[h]
 \centering
@@ -1205,8 +1154,37 @@ release).
 \includegraphics[width=0.85\linewidth]{figs/ablation_plane3dcircle.pdf}}{}
 \caption{Plane3DCircle ablation bars. Reference (green) is EDGE
 at the tuned configuration; each grey bar flips a single design
-knob. CheetahRun and FourTank companions pending compute.}
+knob. CheetahRun companion in the appendix
+(\cref{fig:ablation_cr}); FourTank is not used as an ablation env
+(see appendix intro).}
 \label{fig:ablation_p3dc}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\IfFileExists{figs/ablation_cheetahrun.pdf}{%
+\includegraphics[width=0.85\linewidth]{figs/ablation_cheetahrun.pdf}}{}
+\caption{CheetahRun ablation bars (companion to
+\cref{fig:ablation_p3dc}). Variant spread is small: every variant
+sits within $\sim$$25\%$ of EDGE, consistent with CheetahRun's
+documented low between-method spread on the main results.}
+\label{fig:ablation_cr}
+\end{figure}
+
+\begin{figure}[h]
+\centering
+\IfFileExists{figs/ablation_fourtank.pdf}{%
+\includegraphics[width=0.85\linewidth]{figs/ablation_fourtank.pdf}}{}
+\caption{FourTank ablation bars (companion to
+\cref{fig:ablation_p3dc}). Variant spread is tight ($\sim$$240$ to
+$245$ IQM, on a $\sim 250$-scale task) for every variant except
+the two sanity-check breakers \texttt{random\_expert} ($185$) and
+\texttt{store\_policy\_action} ($210$). Within the tight cluster
+all four 2$\times$2 corners (gate form $\times$ scoring rule)
+sit within seed noise of EDGE: at the F1-anchor task the
+distinguishing axes of EDGE are not individually load-bearing on
+the per-seed scale we measure.}
+\label{fig:ablation_ft}
 \end{figure}
 
 
@@ -1221,8 +1199,7 @@ measured expert performance and the per-task reference scale
 $J_{\mathrm{ref}}$ used to compute the expert-normalized advantage
 $\nbias$ (\cref{eq:nbias}). $J_{\mathrm{ref}}$ is the per-task
 episodic-return ceiling (per-step reward upper bound multiplied by
-episode length); for GlassFurnace we round the $5{,}760$-step ceiling
-up to $6{,}000$. The ceilings are physical upper bounds, so
+episode length). The ceilings are physical upper bounds, so
 $J_{\mathrm{ref}}$ does not depend on any method evaluated in the
 main results.
 
@@ -1274,8 +1251,8 @@ thermal coupling. The expert is a mid-quality PID; long horizon
 makes the asymptote-vs-degradation tradeoff easier to read than on
 shorter setpoint tasks.
 
-\textbf{CheetahRun.} The dm\_control cheetah as wrapped by Mujoco Playground
-\citep{mujocoplayground2024}. Six actuators, 1{,}000-step episodes, reward
+\textbf{CheetahRun.} The dm\_control \citep{tassa2018dmcontrol} cheetah
+as wrapped by Mujoco Playground \citep{mujocoplayground2024}. Six actuators, 1{,}000-step episodes, reward
 is forward velocity plus survival; the task is non-setpoint. The expert is
 a Central Pattern Generator (CPG), an open-loop sinusoidal pattern
 generator with 13 scalar parameters (one frequency, six amplitudes, six
@@ -1332,7 +1309,8 @@ $\Delta = (J_{\mathrm{method}} - J_{\mathrm{SAC}})/|J_{\mathrm{SAC}}|
 
 \paragraph{Hypothesis test.} For each (env, method $\neq$ SAC) we run a
 two-sided Mann-Whitney $U$ test on the per-seed scalars
-(\texttt{scipy.stats.mannwhitneyu}, ``two-sided''). Mann-Whitney is
+(\texttt{scipy.stats.mannwhitneyu} \citep{virtanen2020scipy},
+``two-sided''). Mann-Whitney is
 chosen over a $t$-test because per-seed final-window scores are not
 guaranteed normal: P3DCircle and CheetahRun have heavy left tails
 (seeds that crash early), and SAC's distribution on P3DCircle is
@@ -1360,35 +1338,38 @@ or seed counts change.
 % ============================================================
 
 We confirm each failure mode F1/F2/F3 with one directional test
-whose sign is fixed by the F-mechanism's prediction. F1 and F2 use
-one-sided permutation tests on per-seed final-window IQMs at
-$1\mathrm{M}$ steps ($n{=}50$ per arm, $10^{5}$ shuffles, additive
-$+1$ smoothing on the count). Per-seed values are read from the
-phase3 TB events under
-\texttt{hp\_results/<env>/<method>/trial\_<X>\_phase2\_tb/tensorboard/<run\_id>/};
-the regenerating script is \texttt{run\_directional\_tests.py} at
-the repository root. F3 is observational because the v1 mistuning
-pipeline pre-dates per-seed logging; reported as the ratio of
-JSRL-training-time's fractional drop on the F3 anchor cell to the
-next-worst method's drop on the same cell.
+whose sign is fixed by the F-mechanism's prediction. All three are
+one-sided permutation tests on per-seed final-window IQMs ($n{=}50$
+per arm, $10^{5}$ shuffles, additive $+1$ smoothing on the count).
+Per-seed values are read from the phase3 TB events for F1 and F2,
+and from the per-seed dump of \texttt{run\_degradation\_eval.py}
+for F3. The regenerating script is
+\texttt{run\_directional\_tests.py} at the repository root.
 
 \begin{table}[h]
 \centering
-\small
+\footnotesize
+\setlength{\tabcolsep}{4pt}
 \renewcommand{\arraystretch}{1.15}
-\begin{tabular}{lllrrrl}
+\begin{tabular}{@{}llllrrrl@{}}
 \toprule
-\textbf{Mode} & \textbf{Cell} & \textbf{H1} & \textbf{IQM(a)} & \textbf{IQM(b)} & \textbf{$\Delta$} & \textbf{$p$} \\
+\textbf{Mode} & \textbf{Setting} & \textbf{H1} & \textbf{IQM(a)} & \textbf{IQM(b)} & \textbf{$\Delta$} & \textbf{$p$} \\
 \midrule
-F1 & FourTank clean             & IBRL $<$ SAC      & $239.7$  & $244.0$  & $-4.3$    & $0.031$ \\
-F2 & Plane3DCircle clean        & Residual $<$ JSRL-tt & $3{,}237$ & $9{,}638$ & $-6{,}401$ & $<10^{-4}$ \\
+F1 & FT clean        & IBRL $<$ SAC        & $239.7$   & $244.0$   & $-4.3$     & $0.031$    \\
+F1 & GF clean        & IBRL $<$ SAC        & $5{,}413$ & $5{,}405$ & $+7.9$     & $0.995$    \\
+F2 & P3DC clean      & Residual $<$ JSRL-tt & $3{,}237$ & $9{,}638$ & $-6{,}401$ & $<10^{-4}$ \\
+F2 & P3DC clean      & Residual $<$ IBRL    & $3{,}237$ & $9{,}499$ & $-6{,}262$ & $<10^{-4}$ \\
+F2 & P3DC clean      & Residual $<$ EDGE    & $3{,}237$ & $9{,}318$ & $-6{,}081$ & $<10^{-4}$ \\
 \midrule
-F3 & Plane3DCircle, $\sigma{=}0.5$ mistune & JSRL-tt drop ratio & \multicolumn{4}{l}{\,$187\%$ drop vs next-worst (IBRL) $39\%$; ratio $\approx 4.8\times$} \\
+F3 & P3DC $\sigma{=}0.5$ & JSRL-tt $<$ EDGE & $-6{,}590$ & $-4{,}745$ & $-1{,}845$ & $<10^{-4}$ \\
 \bottomrule
 \end{tabular}
-\caption{Directional tests confirming F1, F2, F3. F1 and F2 are
-one-sided permutation tests on per-seed final-window IQMs; F3 is
-observational (no per-seed logging on v1 mistuning).}
+\caption{One-sided permutation tests on per-seed final-window IQM
+($n{=}50$ per arm, $10^{5}$ shuffles, additive smoothing). F1
+binds on FourTank ($q^{\mathrm{exp}}\!=\!98\%$) but not on
+GlassFurnace ($q^{\mathrm{exp}}\!=\!80\%$): the binding regime is
+tighter than ``near-ceiling'' in the loose sense and we narrow the
+held-out condition accordingly.}
 \label{tab:directional_tests}
 \end{table}
 
@@ -1400,7 +1381,7 @@ observational (no per-seed logging on v1 mistuning).}
 \textbf{Scope.} Evaluation is in simulation with queryable
 deterministic experts on continuous-control tasks; we make no
 sim-to-real claims. Extension to discrete actions or stochastic
-experts (replace $\delta_{\pi^e(s)}$ in \eqref{eq:behavior} with the
+experts (replace $\delta_{\pi^{\mathrm{exp}}(s)}$ in \eqref{eq:behavior} with the
 expert action distribution) is straightforward in principle but
 untested. Three of five tasks are PID-regulated setpoint-tracking
 problems; while they span distinct failure modes of PID control (MIMO
@@ -1432,12 +1413,12 @@ JSONs).
         steps): $\sim$$258$ GPU-hours.
   \item HPO phase 3 (top-1 confirmation, 50--100 seeds $\times$
         $1\mathrm{M}$ steps): $\sim$$51$ GPU-hours.
-  \item Degradation sweeps (v1 expert mistuning $+$ v2 action bias and
+  \item Degradation sweeps (v1 expert undertuning $+$ v2 action bias and
         observation noise; 167 cells $\times$ 50 seeds $\times$ $300\mathrm{k}$
         steps): $\sim$$120$ GPU-hours (estimated; per-cell logs do not
         record \texttt{elapsed\_s} for these runs).
-  \item Ablation study (9 variants on Plane3DCircle $\times$ 50 seeds
-        $\times$ $300\mathrm{k}$ steps): $\sim$$8$ GPU-hours.
+  \item Ablation study ($13$ variants $\times$ 2 envs $\times$ $50$
+        seeds $\times$ $300\mathrm{k}$ steps): $\sim$$25$ GPU-hours.
 \end{itemize}
 Total reported compute is approximately $730$ GPU-hours. The full
 project budget including failed/preliminary runs not in the paper is
@@ -1518,7 +1499,7 @@ per-seed ablation.
 \subsection{CPG Experts, Differential Evolution on Episodic Return}
 
 CPG parameters are tuned by differential evolution \citep{storn1997de} on
-the mean per-seed episodic return, using SciPy's
+the mean per-seed episodic return, using SciPy's \citep{virtanen2020scipy}
 \texttt{differential\_evolution} with population multiplier $5$, $30$
 iterations, and 8-seed evaluation per candidate. Search bounds: frequency
 $\in [0.5, 5.0]$ Hz, amplitudes $\in [0, 1]$ per actuator, phases $\in
@@ -1539,45 +1520,6 @@ trivially exceed the RL upper bound. Both protocols are reproducible from
 the plant simulator alone.
 
 % ============================================================
-\section{Parameterized Expert Policy}
-\label{app:param}
-% ============================================================
-
-A natural alternative to mixing expert and policy \emph{actions} is to
-keep the expert's structural form and let the RL actor tune its
-parameters online. We report such a baseline here. The RL actor outputs a
-log-scale modulation $p_i = p_i^{\text{anchor}} \cdot
-\exp(\log(10)\cdot a_i)$ of each expert parameter: PID gains
-$(K_p, K_i, K_d)$ per tracked loop for the setpoint-tracking tasks, and
-frequency plus per-actuator amplitudes for the CPG-driven locomotion
-tasks (phases are held fixed). The anchor values are the tuned
-parameters from \cref{app:tuning}. This is a qualitatively
-different design from EDGE: the agent never produces a raw action, only
-a re-parameterization of the expert, and cannot express behaviors
-outside the expert's structural family. We report it for reference
-rather than as a head-to-head baseline; full results pending.
-
-% ============================================================
-\section{RLPD-Style Sanity Check}
-\label{app:rlpd}
-% ============================================================
-
-RLPD \citep{ball2023rlpd} was designed for the setting where a fixed
-offline demonstration buffer is available at the start of training and
-sampled at 50\% of every batch alongside the online replay. Our setting
-differs: the expert is queryable online, and there is no fixed offline
-buffer to begin with. To still report a comparison, we run a
-best-effort adaptation (``RLPD-style''): we continuously write expert
-transitions into a dedicated demo buffer during training and enforce a
-50\%/50\% sampling split between that buffer and the online buffer at
-every critic update, with RLPD's high UTD and LayerNorm settings. This
-adaptation is a confounded comparison in both directions (it gives RLPD
-online expert-collection benefits it was not designed for, and the
-50\% split is not tuned for our tasks) and we report it only as a
-sanity check that the EDGE win is not trivially reproduced by a static-
-demo-buffer template. [Results pending.]
-
-% ============================================================
 \section{Reproducibility and Anonymized Code}
 \label{app:reproducibility}
 % ============================================================
@@ -1591,17 +1533,17 @@ links in the camera-ready version.
 \begin{itemize}
     \item \textbf{Continuous-control task suite} (Plane3DCircle,
     FourTank, GlassFurnace dynamics, reward formulas, expert
-    interfaces): \url{https://anonymous.4open.science/r/[ANON-TASKS]}.
+    interfaces): \url{https://anonymous.4open.science/r/control-task-suite}.
     Self-contained dynamics and reward specifications also appear in
     \cref{app:tasks}, so the description in this paper is
     sufficient to reimplement each task without consulting the
     repository.
     \item \textbf{Off-policy RL framework} (SAC base, expert-mixing
     pipelines, JSRL curriculum and training-time variants, IBRL,
-    Residual SAC, EDGE): \url{https://anonymous.4open.science/r/[ANON-RL]}.
+    Residual SAC, EDGE): \url{https://anonymous.4open.science/r/expert-guided-rl-jax}.
     \item \textbf{Experiment harness} (HPO, sweeps, evaluation,
     figure-generating scripts; private GitHub repo, mirrored as a
-    direct upload): \url{https://anonymous.4open.science/r/[ANON-EXP]}.
+    direct upload): \url{https://anonymous.4open.science/r/expert-guided-rl-experiments}.
 \end{itemize}
 
 The mirrors strip author identifiers and committer information.
@@ -1628,12 +1570,17 @@ information:
   \item \textbf{pc-gym} \citep{bloor2024pcgym} (FourTank dynamics):
         MIT license. We adapt the environment into our JAX-pure
         anonymized task suite.
-  \item \textbf{dm\_control / Mujoco Playground}
-        \citep{mujocoplayground2024} (CheetahRun): Apache 2.0 license.
-  \item \textbf{JAX}: Apache 2.0 license.
+  \item \textbf{dm\_control} \citep{tassa2018dmcontrol} and
+        \textbf{Mujoco Playground} \citep{mujocoplayground2024}
+        (CheetahRun): Apache 2.0 license.
+  \item \textbf{JAX} \citep{bradbury2018jax}: Apache 2.0 license.
+  \item \textbf{SciPy} \citep{virtanen2020scipy}: BSD-3 license (used
+        for \texttt{scipy.stats.mannwhitneyu} in the per-cell test
+        family).
 \end{itemize}
 All assets are used in accordance with their licenses, and the
 corresponding citations appear in the bibliography.
 
+\newpage
 \input{neurips_checklist}
 \end{document}

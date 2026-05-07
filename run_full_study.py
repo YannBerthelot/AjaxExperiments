@@ -71,8 +71,11 @@ ENVS: List[str] = [
     "CheetahRun",
     "FourTank",
     "GlassFurnace",
-    "BarkourJoystick",
-    "Plane3DFigureEight",
+    # BarkourJoystick + Plane3DFigureEight deferred: not used in the
+    # current paper, freeing GPUs for FT + F3 v2 mistune cells before
+    # the deadline.
+    # "BarkourJoystick",
+    # "Plane3DFigureEight",
     # BarkourJoystick: CPG returns ~3.5 standalone (joystick-blind forward trot
     # mismatches most random commands), BUT the gait-structured rollouts it
     # produces are far more useful to a learning agent than random actions —
@@ -177,6 +180,8 @@ ABLATION_VARIANTS: List[str] = [
     "edge_qa_with_curriculum",
     # Pessimism axis discrete: β = 0 with softmax gate retained
     "no_pessimism",
+    # 2x2 corner: argmax gate over LCB scores (closes the last cell)
+    "argmax_lcb",
     # Ensemble probe (lowest priority: K=10 is ~2.5x critic cost)
     "large_ensemble",
 ]
