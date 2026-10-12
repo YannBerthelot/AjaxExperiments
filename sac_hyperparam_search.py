@@ -85,7 +85,7 @@ def _set_pdeathsig() -> None:
 from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from envs import make_env_by_name, registered_envs
 
@@ -258,7 +258,6 @@ class HPParams:
     target_noise_clip: Optional[float] = None
     policy_delay: Optional[int] = None
     # quality-aware-only (None for other methods)
-    pre_train_n_steps: Optional[int] = None
     num_critics: Optional[int] = None
     qa_temperature: Optional[float] = None
     # Expert-buffer prefill (gentler than actor BC — populates replay
@@ -410,7 +409,6 @@ def suggest_params(trial, method: str = "sac") -> HPParams:
             policy_update_start = trial.suggest_int(
                 "policy_update_start", 1_000, 50_000, log=True
             )
-    pre_train_n_steps = None
     num_critics = None
     qa_temperature = None
     expert_buffer_n_steps_value = None
@@ -436,7 +434,6 @@ def suggest_params(trial, method: str = "sac") -> HPParams:
         # FourTank to test whether the lower-bound β=0.1 saturation in
         # the standard sac_quality_aware HPO indicates an unexplored
         # optimistic optimum.
-        pre_train_n_steps = 0
         target_entropy_initial_per_dim = None
         target_entropy_ramp_frac = None
         qa_temperature = 1.0  # not used under LCB
@@ -506,7 +503,6 @@ def suggest_params(trial, method: str = "sac") -> HPParams:
         target_policy_noise=target_policy_noise,
         target_noise_clip=target_noise_clip,
         policy_delay=policy_delay,
-        pre_train_n_steps=pre_train_n_steps,
         num_critics=num_critics,
         qa_temperature=qa_temperature,
         expert_buffer_n_steps=expert_buffer_n_steps_value,
@@ -782,11 +778,6 @@ def _build_method_kwargs(method: str, expert_policy, params: HPParams,
             epsilon_floor=0.0,         # no floor
             target_entropy_initial_per_dim=None,
             target_entropy_ramp_frac=0.5,  # unused when initial is None
-            pre_train_n_steps=0,
-            skip_actor_pretrain=True,
-            skip_critic_pretrain=True,
-            reset_log_std_after_bc=False,
-            reset_actor_head_after_bc=False,
             expert_buffer_n_steps=0,
             expert_mix_fraction=0.0,
             # Disable competing EDGE flags
@@ -886,7 +877,6 @@ def _hpparams_from_dict(
         # Use ``_opt_int`` / ``_opt_float`` helpers so a None value (which
         # happens when a hardcoded HP slot is null in trial_<n>_params.json)
         # passes through cleanly instead of crashing on ``int(None)``.
-        pre_train_n_steps=_opt_int(best_params.get("pre_train_n_steps")),
         num_critics=_opt_int(best_params.get("num_critics")),
         qa_temperature=_opt_float(best_params.get("qa_temperature")),
         expert_buffer_n_steps=_opt_int(
@@ -978,7 +968,6 @@ def _construct_agent(method, env, env_params, expert_policy, params, method_kwar
     return SAC(
         env_id=env,
         env_params=env_params,
-        action_scale=1.0,
         eval_expert_policy=expert_policy,
         actor_learning_rate=params.actor_lr,
         critic_learning_rate=params.critic_lr,
@@ -1005,6 +994,7 @@ def build_agent_and_train(
     expert_override: Optional[object] = None,
     method_kwargs_override: Optional[dict] = None,
     num_episode_test: int = None,
+    env_wrapper: Optional[Callable] = None,
 ):
     """Build a SAC agent with ``best_params`` and train on ``seed_list`` seeds
     for ``n_timesteps`` environment steps.
@@ -1036,6 +1026,9 @@ def build_agent_and_train(
     num_episode_test : int, optional
         Number of evaluation episodes between log checkpoints. Defaults to
         the module-level ``NUM_EPISODE_TEST``.
+    env_wrapper : callable, optional
+        Applied to the env the agent trains on, after the expert is loaded
+        from the bare env (used by degradation study v2's observation noise).
 
     Returns
     -------
@@ -1062,6 +1055,8 @@ def build_agent_and_train(
         if expert_override is not None
         else _load_expert_policy(env_name, env)
     )
+    if env_wrapper is not None:
+        env = env_wrapper(env)
     params = _hpparams_from_dict(
         best_params, method=method, n_timesteps=n_timesteps
     )
@@ -1159,9 +1154,9 @@ def run_worker(
     CUDA_VISIBLE_DEVICES is set in the environment by the master before
     launching this subprocess.
     """
+    import jax
     from ajax import SAC
     from ajax.logging.wandb_logging import LoggingConfig
-    from ajax.plane.plane_exps_utils import get_mode
 
     if eval_window is None:
         eval_window = _eval_window(n_timesteps)
@@ -1215,9 +1210,9 @@ def run_worker(
         total_timesteps=n_timesteps,
     )
 
-    mode = get_mode()
+    backend = jax.default_backend()
     print(
-        f"[trial {params.trial_number:03d}] device={mode}  "
+        f"[trial {params.trial_number:03d}] device={backend}  "
         f"actor_lr={params.actor_lr:.1e}  critic_lr={params.critic_lr:.1e}  "
         f"alpha_lr={params.alpha_lr:.1e}  γ={params.gamma:.4f}  τ={params.tau:.1e}  "
         f"tep={params.target_entropy_per_dim:.2f}  α₀={params.alpha_init:.2f}  "
@@ -1227,7 +1222,7 @@ def run_worker(
 
     t0 = time.time()
     seed_list = list(range(seed_offset, seed_offset + n_seeds))
-    if mode == "CPU":
+    if backend != "gpu":
         from tqdm import tqdm
 
         for seed in tqdm(seed_list, desc=f"trial_{params.trial_number:03d}"):
