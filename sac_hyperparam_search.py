@@ -968,7 +968,6 @@ def _construct_agent(method, env, env_params, expert_policy, params, method_kwar
     return SAC(
         env_id=env,
         env_params=env_params,
-        action_scale=1.0,
         eval_expert_policy=expert_policy,
         actor_learning_rate=params.actor_lr,
         critic_learning_rate=params.critic_lr,
