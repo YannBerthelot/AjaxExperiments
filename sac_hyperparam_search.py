@@ -85,7 +85,7 @@ def _set_pdeathsig() -> None:
 from collections import deque
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from envs import make_env_by_name, registered_envs
 
@@ -1005,6 +1005,7 @@ def build_agent_and_train(
     expert_override: Optional[object] = None,
     method_kwargs_override: Optional[dict] = None,
     num_episode_test: int = None,
+    env_wrapper: Optional[Callable] = None,
 ):
     """Build a SAC agent with ``best_params`` and train on ``seed_list`` seeds
     for ``n_timesteps`` environment steps.
@@ -1036,6 +1037,9 @@ def build_agent_and_train(
     num_episode_test : int, optional
         Number of evaluation episodes between log checkpoints. Defaults to
         the module-level ``NUM_EPISODE_TEST``.
+    env_wrapper : callable, optional
+        Applied to the env the agent trains on, after the expert is loaded
+        from the bare env (used by degradation study v2's observation noise).
 
     Returns
     -------
@@ -1062,6 +1066,8 @@ def build_agent_and_train(
         if expert_override is not None
         else _load_expert_policy(env_name, env)
     )
+    if env_wrapper is not None:
+        env = env_wrapper(env)
     params = _hpparams_from_dict(
         best_params, method=method, n_timesteps=n_timesteps
     )

@@ -10,13 +10,16 @@ expert's internal tuning intact:
                        ``fold_in(key, env_idx)``. Each of the ``n_seeds``
                        parallel envs gets its own constant bias for the run.
                        Models miscalibrated actuator zero.
-  * ``obs_noise``   : both agent and expert see ``obs + σ·obs_std·N(0, I)``
-                       per env-step. Per-dim obs std is estimated by a
-                       short warmup pass (cached to ``obs_std/<env>.npy``) so
-                       σ is dimensionless and comparable across envs. The
-                       noise hook lives in ``Ajax/src/ajax/environments/
-                       interaction.py:_maybe_noise_obs`` and is opt-in via
-                       env attributes set here.
+  * ``obs_noise``   : the agent sees ``obs + σ·obs_std·N(0, I)``, drawn
+                       afresh at every reset and env-step. Per-dim obs std
+                       is estimated by a short warmup pass (cached to
+                       ``obs_std/<env>.npy``) so σ is dimensionless and
+                       comparable across envs. The training env is wrapped
+                       in Ajax's ``ObservationNoiseWrapper`` (target_gym) or
+                       ``ObservationNoiseWrapperBrax`` (Playground / Brax).
+                       The expert reads the env's raw observation: the
+                       noiseless ``get_obs`` on target_gym envs, the noisy
+                       ``state.obs`` on Playground / Brax.
   * ``action_dropout`` (TBD, deferred): with prob ``p`` repeat the last
                        action instead of querying the expert. Models
                        intermittent expert availability. Implemented as a
@@ -138,6 +141,7 @@ def main() -> int:
 
     action_dim = _probe_action_dim(anchor_expert, env)
 
+    env_wrapper = None
     if args.degradation_type == "action_bias":
         sigma = float(args.intensity)
         # Per-seed independent bias: deterministic from (degradation_seed, env_idx).
@@ -150,15 +154,9 @@ def main() -> int:
             action_dim=action_dim,
         )
     elif args.degradation_type == "obs_noise":
-        sigma = float(args.intensity)
-        # Obs noise is plumbed via Ajax's interaction.py:_maybe_noise_obs hook
-        # (added in Ajax tree). The hook reads two attributes off the env:
-        # _obs_noise_sigma (scalar) and _obs_noise_obs_std ((obs_dim,) per-dim
-        # scale, default 1.0). Both agent and expert see the same noisy obs
-        # because the hook fires AFTER env.step / env.reset, BEFORE the obs
-        # is consumed by either consumer.
-        env._obs_noise_sigma = sigma  # type: ignore[attr-defined]
-        env._obs_noise_obs_std = _load_obs_std(args.env)  # type: ignore[attr-defined]
+        # build_agent_and_train builds its own env: the noise must wrap that
+        # one, not the env built here.
+        env_wrapper = _obs_noise_wrapper(args.env, float(args.intensity))
         # Expert is unwrapped: the noise is on the env, not the expert.
         degraded = anchor_expert
     else:
@@ -196,6 +194,7 @@ def main() -> int:
             n_timesteps=chunk_steps,
             checkpoint_path=str(ckpt_path) if args.n_chunks > 1 else None,
             expert_override=degraded,
+            env_wrapper=env_wrapper,
         )
         if args.n_chunks > 1:
             from ajax.checkpoint import save_checkpoint
@@ -374,6 +373,23 @@ def _load_obs_std(env_name: str):
     import numpy as np
     arr = np.load(cache)
     return jnp.asarray(arr)
+
+
+def _obs_noise_wrapper(env_name: str, sigma: float):
+    """Return a function wrapping an env so that its observations are
+    ``obs + sigma * obs_std * N(0, I)`` (Ajax's observation-noise wrappers,
+    the Brax one for Playground / Brax stacks)."""
+    from ajax.environments.utils import get_env_type
+    from ajax.wrappers import ObservationNoiseWrapper, ObservationNoiseWrapperBrax
+
+    obs_std = _load_obs_std(env_name)
+
+    def wrap(env):
+        if get_env_type(env) == "brax":
+            return ObservationNoiseWrapperBrax(env, sigma=sigma, scale=obs_std)
+        return ObservationNoiseWrapper(env, sigma=sigma, scale=obs_std)
+
+    return wrap
 
 
 # NOTE: action_dropout (deferred per user; "do at end if time"). Will be
