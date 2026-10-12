@@ -258,7 +258,6 @@ class HPParams:
     target_noise_clip: Optional[float] = None
     policy_delay: Optional[int] = None
     # quality-aware-only (None for other methods)
-    pre_train_n_steps: Optional[int] = None
     num_critics: Optional[int] = None
     qa_temperature: Optional[float] = None
     # Expert-buffer prefill (gentler than actor BC — populates replay
@@ -410,7 +409,6 @@ def suggest_params(trial, method: str = "sac") -> HPParams:
             policy_update_start = trial.suggest_int(
                 "policy_update_start", 1_000, 50_000, log=True
             )
-    pre_train_n_steps = None
     num_critics = None
     qa_temperature = None
     expert_buffer_n_steps_value = None
@@ -436,7 +434,6 @@ def suggest_params(trial, method: str = "sac") -> HPParams:
         # FourTank to test whether the lower-bound β=0.1 saturation in
         # the standard sac_quality_aware HPO indicates an unexplored
         # optimistic optimum.
-        pre_train_n_steps = 0
         target_entropy_initial_per_dim = None
         target_entropy_ramp_frac = None
         qa_temperature = 1.0  # not used under LCB
@@ -506,7 +503,6 @@ def suggest_params(trial, method: str = "sac") -> HPParams:
         target_policy_noise=target_policy_noise,
         target_noise_clip=target_noise_clip,
         policy_delay=policy_delay,
-        pre_train_n_steps=pre_train_n_steps,
         num_critics=num_critics,
         qa_temperature=qa_temperature,
         expert_buffer_n_steps=expert_buffer_n_steps_value,
@@ -782,11 +778,6 @@ def _build_method_kwargs(method: str, expert_policy, params: HPParams,
             epsilon_floor=0.0,         # no floor
             target_entropy_initial_per_dim=None,
             target_entropy_ramp_frac=0.5,  # unused when initial is None
-            pre_train_n_steps=0,
-            skip_actor_pretrain=True,
-            skip_critic_pretrain=True,
-            reset_log_std_after_bc=False,
-            reset_actor_head_after_bc=False,
             expert_buffer_n_steps=0,
             expert_mix_fraction=0.0,
             # Disable competing EDGE flags
@@ -886,7 +877,6 @@ def _hpparams_from_dict(
         # Use ``_opt_int`` / ``_opt_float`` helpers so a None value (which
         # happens when a hardcoded HP slot is null in trial_<n>_params.json)
         # passes through cleanly instead of crashing on ``int(None)``.
-        pre_train_n_steps=_opt_int(best_params.get("pre_train_n_steps")),
         num_critics=_opt_int(best_params.get("num_critics")),
         qa_temperature=_opt_float(best_params.get("qa_temperature")),
         expert_buffer_n_steps=_opt_int(
