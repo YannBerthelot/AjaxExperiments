@@ -9,6 +9,12 @@ package-mode = false
 python = ">=3.11,<4.0"
 ajax = {path = "../Ajax", develop = true}
 target-gym = {path = "../TargetGym", develop = true}
+# Imported by the plotting and analysis scripts (plot_sweep.py caches to
+# parquet through pyarrow). Ajax declared them; it stops doing so.
+pandas = ">=2.1.1,<3"
+pyarrow = ">=23.0.1,<24"
+statsmodels = ">=0.14.6,<0.15"
+matplotlib = ">=3.8.0,<4"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.11.6"
