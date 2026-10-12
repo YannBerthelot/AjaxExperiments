@@ -1159,9 +1159,9 @@ def run_worker(
     CUDA_VISIBLE_DEVICES is set in the environment by the master before
     launching this subprocess.
     """
+    import jax
     from ajax import SAC
     from ajax.logging.wandb_logging import LoggingConfig
-    from ajax.plane.plane_exps_utils import get_mode
 
     if eval_window is None:
         eval_window = _eval_window(n_timesteps)
@@ -1215,9 +1215,9 @@ def run_worker(
         total_timesteps=n_timesteps,
     )
 
-    mode = get_mode()
+    backend = jax.default_backend()
     print(
-        f"[trial {params.trial_number:03d}] device={mode}  "
+        f"[trial {params.trial_number:03d}] device={backend}  "
         f"actor_lr={params.actor_lr:.1e}  critic_lr={params.critic_lr:.1e}  "
         f"alpha_lr={params.alpha_lr:.1e}  γ={params.gamma:.4f}  τ={params.tau:.1e}  "
         f"tep={params.target_entropy_per_dim:.2f}  α₀={params.alpha_init:.2f}  "
@@ -1227,7 +1227,7 @@ def run_worker(
 
     t0 = time.time()
     seed_list = list(range(seed_offset, seed_offset + n_seeds))
-    if mode == "CPU":
+    if backend != "gpu":
         from tqdm import tqdm
 
         for seed in tqdm(seed_list, desc=f"trial_{params.trial_number:03d}"):
