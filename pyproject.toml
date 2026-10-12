@@ -7,7 +7,8 @@ package-mode = false
 
 [tool.poetry.dependencies]
 python = ">=3.11,<4.0"
-ajax = {path = "../Ajax", develop = true}
+# The GPU runs need CUDA, which Ajax now pulls only on request.
+ajax = {path = "../Ajax", develop = true, extras = ["cuda"]}
 target-gym = {path = "../TargetGym", develop = true}
 # Imported by the plotting and analysis scripts (plot_sweep.py caches to
 # parquet through pyarrow). Ajax declared them; it stops doing so.
