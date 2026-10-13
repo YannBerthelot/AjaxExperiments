@@ -1,0 +1,52 @@
+# Runs the tests against the latest Ajax and TargetGym. pyproject.toml takes
+# both from sibling folders (../Ajax, ../TargetGym), so the job checks them
+# out next to this repository.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JAX_PLATFORMS: cpu
+    steps:
+      # Ajax's Linux dependencies pull CUDA wheels (several GB); the runner's
+      # root disk fills during the install without this.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - uses: actions/checkout@v7
+        with:
+          path: AjaxExperiments
+      - uses: actions/checkout@v7
+        with:
+          repository: YannBerthelot/Ajax
+          path: Ajax
+      - uses: actions/checkout@v7
+        with:
+          repository: YannBerthelot/TargetGym
+          path: TargetGym
+          # TargetGym's version comes from its git tags (hatch-vcs).
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install Poetry
+        run: pipx install poetry==2.2.1
+      - name: Install
+        working-directory: AjaxExperiments
+        run: poetry install --no-interaction
+      - name: Tests
+        working-directory: AjaxExperiments
+        run: poetry run pytest -q tests

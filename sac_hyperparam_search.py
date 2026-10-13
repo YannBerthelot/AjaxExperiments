@@ -1118,7 +1118,7 @@ def _load_expert_policy(env_name: str, env):
 
     For TargetGym-native envs we fall back to ``env.expert_policy``.
     For Mujoco Playground locomotion envs we use a CPG factory from
-    ``target_gym.experts.cpg`` (CheetahRun, BarkourJoystick).
+    ``cpg_experts`` (CheetahRun, BarkourJoystick).
     """
     import pickle
 
@@ -1129,7 +1129,7 @@ def _load_expert_policy(env_name: str, env):
 
     key = env_name.lower()
     if key in _CPG_EXPERT_FACTORIES:
-        import target_gym.experts.cpg as cpg_mod
+        import cpg_experts as cpg_mod
         factory = getattr(cpg_mod, _CPG_EXPERT_FACTORIES[key])
         return factory()
 
