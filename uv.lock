@@ -58,6 +58,12 @@ dependencies = [
     { name = "tqdm" },
 ]
 
+[package.optional-dependencies]
+cuda = [
+    { name = "jax", version = "0.10.2", source = { registry = "https://pypi.org/simple" }, extra = ["cuda"], marker = "python_full_version < '3.12' and sys_platform == 'linux'" },
+    { name = "jax", version = "0.11.2", source = { registry = "https://pypi.org/simple" }, extra = ["cuda"], marker = "python_full_version >= '3.12' and sys_platform == 'linux'" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "brax", specifier = ">=0.14.2,<0.15" },
@@ -110,7 +116,7 @@ name = "ajax-experiments"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "ajax" },
+    { name = "ajax", extra = ["cuda"] },
     { name = "gymnax" },
     { name = "matplotlib" },
     { name = "pandas" },
@@ -129,7 +135,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ajax", editable = "../Ajax" },
+    { name = "ajax", extras = ["cuda"], editable = "../Ajax" },
     { name = "gymnax", git = "https://github.com/YannBerthelot/gymnax.git?branch=chore%2Frelax-runtime-pins" },
     { name = "matplotlib", specifier = ">=3.8.0,<4" },
     { name = "pandas", specifier = ">=2.1.1,<3" },

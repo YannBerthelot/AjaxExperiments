@@ -6,7 +6,8 @@ authors = [{ name = "Yann Berthelot", email = "yannberthelot1@gmail.com" }]
 # Ajax and TargetGym support Python 3.11 to 3.13.
 requires-python = ">=3.11,<3.14"
 dependencies = [
-    "ajax",
+    # The GPU runs need CUDA, which Ajax pulls only on request (Linux only).
+    "ajax[cuda]",
     "target-gym",
     # Ajax takes gymnax from the branch in [tool.uv.sources]; gymnax 1.0.0 on
     # PyPI caps gymnasium below Ajax's floor. Drop this line and its source
