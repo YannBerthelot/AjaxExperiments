@@ -1,7 +1,7 @@
 """Expert-degradation sensitivity study.
 
 Same setup as run_final_eval.py, but the expert is perturbed via
-``target_gym.experts.degradation.degrade_expert(expert, sigma, key)``
+``expert_degradation.degrade_expert(expert, sigma, key)``
 before training. Writes to ``degradation_results/<env>__<method>__sigmaS.json``.
 """
 
@@ -58,7 +58,7 @@ def main() -> int:
     import optuna
     from optuna.trial import TrialState
     from envs import make_env_by_name  # type: ignore
-    from target_gym.experts.degradation import degrade_expert
+    from expert_degradation import degrade_expert
 
     # Best hparams. All methods now use per-method subdirs.
     study_name = f"{args.method}_hp_search_{args.env.lower()}"
