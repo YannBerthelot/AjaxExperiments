@@ -39,24 +39,24 @@ Registered in [envs.py](envs.py): `FourTank`, `GlassFurnace`,
 ## Reproducing the paper
 
 ```bash
-# 1. Pinned environment.
-poetry install
+# 1. Pinned environment (Ajax and TargetGym checked out next to this folder).
+uv sync
 
 # 2. (Locomotion only) tune the open-loop CPG expert once per env.
-poetry run python tune_cpg.py --env CheetahRun
-poetry run python tune_cpg.py --env BarkourJoystick
+uv run python tune_cpg.py --env CheetahRun
+uv run python tune_cpg.py --env BarkourJoystick
 
 # 3. Full study: HPO -> final eval -> degradation sweep, all
 #    (env, method) cells, distributed across visible GPUs, resumable.
-./run_safely.sh poetry run python run_full_study.py --gpus 0 1 2
+./run_safely.sh uv run python run_full_study.py --gpus 0 1 2
 
 # 4. Status of scheduled / running / completed work units.
-poetry run python run_full_study.py --status
+uv run python run_full_study.py --status
 
 # 5. Build the paper tables and figures from the populated results.
-poetry run python make_main_table.py        # tab:main_perenv
-poetry run python plot_sweep.py --paper     # per-env headline + ablation + degradation
-poetry run python run_directional_tests.py  # F1, F2, F3 directional p-values
+uv run python make_main_table.py        # tab:main_perenv
+uv run python plot_sweep.py --paper     # per-env headline + ablation + degradation
+uv run python run_directional_tests.py  # F1, F2, F3 directional p-values
 ```
 
 `run_full_study.py` is the canonical entry point; the per-stage
@@ -75,7 +75,7 @@ scripts below are only useful for re-running individual cells.
 Single-cell HPO example:
 
 ```bash
-./run_safely.sh poetry run python sac_hyperparam_search.py \
+./run_safely.sh uv run python sac_hyperparam_search.py \
     --env Plane3DCircle --method sac_quality_aware \
     --gpus 0 --trials 30 \
     --search-timesteps 300000 --search-seeds 20 \
@@ -134,5 +134,5 @@ plus a few mechanistic probes:
 | `tune_cpg.py`               | One-off optimisation of the CPG expert's frequency / amplitudes / phases per locomotion task.                                    |
 | `run_safely.sh`             | Wraps long-running commands in `setsid nohup` with a timestamped log so they survive SSH logout. See [COMMANDS.md](COMMANDS.md). |
 | `paper/`                    | LaTeX sources (`paper.tex`, NeurIPS style file, appendices). Build artefacts under `paper/build/` are gitignored.                |
-| `pyproject.toml`, `poetry.lock` | Pinned Python environment.                                                                                                   |
+| `pyproject.toml`, `uv.lock`     | Pinned Python environment.                                                                                                   |
 | `tests/test_env_registry.py` | Sanity-check that every env declared in `envs.py` builds, exposes the expected obs/action shapes, and runs an expert step.       |
