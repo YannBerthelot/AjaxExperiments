@@ -48,9 +48,12 @@ jobs:
           version: "0.11.28"
           enable-cache: true
           prune-cache: true
+      # Not --locked: the job tests against the latest Ajax and TargetGym,
+      # whose dependencies can change after uv.lock was written; uv then
+      # re-resolves instead of failing on a stale lock.
       - name: Install
         working-directory: AjaxExperiments
-        run: uv sync --locked
+        run: uv sync
       - name: Tests
         working-directory: AjaxExperiments
         run: uv run pytest -q tests
