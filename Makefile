@@ -6,8 +6,8 @@
 #   make paper         # plot + latexmk in paper/ (assumes pdflatex installed)
 #   make paper-clean   # remove paper/build/
 
-POETRY := poetry
-PYTHON := $(POETRY) run python
+UV := uv
+PYTHON := $(UV) run python
 PLOT_SCRIPT := plot_sweep.py
 PAPER_DIR := paper
 FIGS_DIR := $(PAPER_DIR)/figs
