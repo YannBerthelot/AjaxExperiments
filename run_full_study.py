@@ -17,8 +17,8 @@ Idempotent: on startup we scan existing Optuna DBs and final-eval JSON
 files and skip work units that are already done.
 
 Usage:
-    poetry run python run_full_study.py           # run the plan
-    poetry run python run_full_study.py --dry-run # print the plan and exit
+    uv run python run_full_study.py           # run the plan
+    uv run python run_full_study.py --dry-run # print the plan and exit
 """
 
 from __future__ import annotations
