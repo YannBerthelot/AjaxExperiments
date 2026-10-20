@@ -7,7 +7,9 @@ authors = [{ name = "Yann Berthelot", email = "yannberthelot1@gmail.com" }]
 requires-python = ">=3.12,<3.14"
 dependencies = [
     # The GPU runs need CUDA, which Ajax pulls only on request (Linux only).
-    "ajax[cuda]",
+    # The Brax and MuJoCo Playground environments come with Ajax's playground
+    # extra, which Ajax 0.5.0 requires for them.
+    "ajax[cuda,playground]",
     "target-gym",
     # Imported by the plotting and analysis scripts (plot_sweep.py caches to
     # parquet through pyarrow). Ajax declared them; it stops doing so.
