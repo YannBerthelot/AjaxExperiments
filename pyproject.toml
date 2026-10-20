@@ -3,16 +3,12 @@ name = "ajax-experiments"
 version = "0.1.0"
 description = "Experiment scripts, sweeps, and plotting for the Ajax RL library"
 authors = [{ name = "Yann Berthelot", email = "yannberthelot1@gmail.com" }]
-# Ajax and TargetGym support Python 3.11 to 3.13.
-requires-python = ">=3.11,<3.14"
+# Ajax needs Python 3.12 or newer; TargetGym supports up to 3.13.
+requires-python = ">=3.12,<3.14"
 dependencies = [
     # The GPU runs need CUDA, which Ajax pulls only on request (Linux only).
     "ajax[cuda]",
     "target-gym",
-    # Ajax takes gymnax from the branch in [tool.uv.sources]; gymnax 1.0.0 on
-    # PyPI caps gymnasium below Ajax's floor. Drop this line and its source
-    # when Ajax goes back to a gymnax release.
-    "gymnax",
     # Imported by the plotting and analysis scripts (plot_sweep.py caches to
     # parquet through pyarrow). Ajax declared them; it stops doing so.
     "pandas>=2.1.1,<3",
@@ -36,4 +32,3 @@ package = false
 [tool.uv.sources]
 ajax = { path = "../Ajax", editable = true }
 target-gym = { path = "../TargetGym", editable = true }
-gymnax = { git = "https://github.com/YannBerthelot/gymnax.git", branch = "chore/relax-runtime-pins" }
